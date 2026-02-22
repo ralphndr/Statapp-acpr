@@ -1,0 +1,954 @@
+Stat App: ACPR
+
+--- First chunk: import libraries nécessaires---
+```{r Libraries}
+library(readr)      
+library(janitor)     # cleaning
+library(dplyr)     
+library(tidyr)       # reshaping 
+library(skimr)       # data summary
+library(summarytools) 
+library(Hmisc)       # advanced stats
+library(stats)    
+library(car)         # ANOVA, regression diagnostics
+library(psych)       # descriptive stats, corr
+library(MASS)        # distrib
+library(lmtest)      # regression tests 
+library(sandwich)    # robust standard errors
+library(multcomp)    # post-hoc tests
+library(lme4)        # mixed models
+library(caret)       # unified ML interface
+library(randomForest)
+library(e1071)       # SVMs, Naive Bayes
+library(cluster)     # clustering
+library(factoextra)  # PCA
+library(knitr)       
+library(kableExtra) 
+library(rmarkdown)  
+library(scales)
+library(stringr)
+```
+
+```{r aide}
+# aide: description détaillée (déciles, quartiles, moyenne, variance, mode)
+get_mode <- function(x) { ux <- unique(x); ux[which.max(tabulate(match(x, ux)))] }
+compute_detailed_summary <- function(df, group_col, value_col) {
+	df %>%
+		group_by(!!rlang::sym(group_col)) %>%
+		summarise(
+			n = sum(!is.na(.data[[value_col]])),
+			min = min(.data[[value_col]], na.rm = TRUE),
+			p01 = quantile(.data[[value_col]], 0.01, na.rm = TRUE),
+			p05 = quantile(.data[[value_col]], 0.05, na.rm = TRUE),
+			p10 = quantile(.data[[value_col]], 0.10, na.rm = TRUE),
+			p20 = quantile(.data[[value_col]], 0.20, na.rm = TRUE),
+			p25 = quantile(.data[[value_col]], 0.25, na.rm = TRUE),
+			p30 = quantile(.data[[value_col]], 0.30, na.rm = TRUE),
+			p40 = quantile(.data[[value_col]], 0.40, na.rm = TRUE),
+			p50 = quantile(.data[[value_col]], 0.50, na.rm = TRUE),
+			p60 = quantile(.data[[value_col]], 0.60, na.rm = TRUE),
+			p70 = quantile(.data[[value_col]], 0.70, na.rm = TRUE),
+			p75 = quantile(.data[[value_col]], 0.75, na.rm = TRUE),
+			p80 = quantile(.data[[value_col]], 0.80, na.rm = TRUE),
+			p90 = quantile(.data[[value_col]], 0.90, na.rm = TRUE),
+			p95 = quantile(.data[[value_col]], 0.95, na.rm = TRUE),
+			p99 = quantile(.data[[value_col]], 0.99, na.rm = TRUE),
+			mean = mean(.data[[value_col]], na.rm = TRUE),
+			variance = var(.data[[value_col]], na.rm = TRUE),
+			sd = sd(.data[[value_col]], na.rm = TRUE),
+			mode = get_mode(.data[[value_col]]),
+			max = max(.data[[value_col]], na.rm = TRUE),
+			.groups = "drop"
+		)
+}
+```
+
+```{r filtre}
+
+# identification des colonnes (format: "YYYY-Qx")
+quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
+if(length(quarter_cols) == 0) stop("No quarter columns found.")
+
+# Case-insensitive partial match -> locate the desired col
+bsp_col <- names(data)[grepl("Balance.*sheet.*position|Balance.*position", names(data), ignore.case = TRUE)]
+if(length(bsp_col) == 0) {
+	stop("Couldn't find the targeted column.")
+}
+bsp_col <- bsp_col[1]
+
+# Pivot to long format + keep descriptive cols
+long <- data %>%
+  pivot_longer(cols = all_of(quarter_cols), names_to = "period", values_to = "amount") %>%
+  mutate(amount = as.numeric(amount))
+
+long_filtered <- long %>%
+  filter(
+    `Reporting country` == "All reporting countries", 
+    `Counterparty country` == "All countries (total)",
+    `Type of instruments` == "All instruments",
+    `Currency denomination` == "All currencies",
+    `Counterparty sector` == "All sectors",
+    `Measure` == "Amounts outstanding / Stocks",                
+    `Type of reporting institutions` == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)", 
+    `Position type` == "Cross-border",
+    `Currency type of reporting country` == "All currencies (=D+F+U)",
+    `Parent country` == "All countries (total)"
+  )
+
+check_rows <- long_filtered %>% 
+  group_by(period, `Balance sheet position`) %>% 
+  tally()
+
+ print(check_rows)
+  
+```
+
+--- premier niveau de resume des donnees + infos de base ---
+```{r Brève description}
+# data <- read.csv("Locational_Banking_Statistics_for_Stat_App.csv")
+data <- read_csv("/Users/ralphnader/Desktop/Statapp/WS_LBS_D_PUB_csv_col.csv")
+capture.output(skim(data), file = "skim_output.txt")
+```
+
+The output shows that our dataset has the following structure:
+_______________________
+Number of rows             608020  
+Number of columns          223   
+_______________________          
+Column type frequency:           
+  character                29    
+  logical                  2     
+  numeric                  192 
+________________________
+
+After thorough inspection, we quickly notice that only the "character" columns are descriptive variables. The "logical" columns are 
+supposed to be indicators of the time format but will be removed since they are completely empty. Finally, the "numeric" columns are
+time series data which implies that we will need to reformat them in order to use them when plotting time series graphs.
+
+--- Data cleaning and preprocessing ---
+```{r valeurs manquantes}
+# valeurs manquantes par col
+missing_by_var <- data %>%
+	summarise(across(everything(), ~ sum(is.na(.)))) %>%
+	pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+	mutate(pct_missing = 100 * n_missing / nrow(data)) %>%
+	arrange(desc(pct_missing))
+
+# table 
+knitr::kable(missing_by_var, digits = c(0, 2), caption = "Missing values per variable") %>%
+	kableExtra::kable_styling(full_width = FALSE)
+
+write.csv(missing_by_var, "missing_summary.csv", row.names = FALSE)
+```
+
+From the table returned, we can identify different scenarios depending on the variable:
+- Variables with 100% missing values: both 'TIME_FORMAT' & 'Time.Format' can be removed from our dataset.
+- Variables with no missing values at all: basically every descriptive variable which is reassuring since it means
+we will not have to fill them using some imputation method (e.g. mean, median, mode, etc.).
+- Variables with partial missing values: time series columns are the ones concerend here. One observation that can be made
+is that the more recent the year, the less missing values there are (for instance, we go from ~87% missing values in the first years
+covered by the database - around 1978- to ~21% in the most recent year - 2022). Note that this is a pretty progressive tendency except 2
+jumps of ~10% in 1995 and 2013.
+
+-> This increase in data completeness over time could have several interpretations depending on its root cause:
+    1) Changes in data reporting and/or collection practices.
+    2) Increased activity: more actors have been participating lately compared ti the early 80s.
+    
+```{r series temp manquant}
+missing_pct <- colMeans(is.na(data[quarter_cols])) * 100
+
+plot_data <- data.frame(
+  Quarter_Name = names(missing_pct),
+  Missing_Pct = missing_pct
+)
+
+plot_data$Date <- yq(plot_data$Quarter_Name)
+
+# plot
+ggplot(plot_data, aes(x = Date, y = Missing_Pct)) +
+  geom_line(color = "navyblue", linewidth = 1) +  # continuous line
+  scale_x_date(
+    date_breaks = "5 years",    # tick every 5 years
+    date_labels = "%Y"          
+  ) +
+  labs(
+    x = "Année",
+    y = "Valeur manquantes (%)"
+  ) +
+  theme_minimal() +             
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("valeurs_manquantes.pdf", width = 8, height = 5)
+```
+
+```{r Retrait colonnes}
+# Print original shape
+cat("Database shape:", dim(data)[1], ",", dim(data)[2], "\n")
+
+# Drop cols with 100% missing values
+cols_to_drop <- c("TIME_FORMAT", "Time Format")
+present <- cols_to_drop[cols_to_drop %in% names(data)]
+if(length(present) == 0) {
+	cat("No targetted columns found: none removed.\n")
+} else {
+	data <- data %>% dplyr::select(-dplyr::any_of(present))
+	cat("Dropped columns:", paste(present, collapse = ", "), "\n")
+}
+
+# New shape
+cat("Database shape:", dim(data)[1], ",", dim(data)[2], "\n")
+```
+
+When running this cell, we get:
+        1) Database shape: 608020 , 223 
+        2) Database shape: 608020 , 221 
+which confirms that the two columns have been removed successfully.
+
+--- Stats descrp ---
+```{r Stats descrp}
+quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
+bsp_col <- names(data)[grepl("Balance.*sheet.*position|Balance.*position", names(data), ignore.case = TRUE)][1]
+
+if(FALSE) {
+long <- data %>%
+  pivot_longer(cols = all_of(quarter_cols), names_to = "period", values_to = "amount") %>%
+  mutate(amount = as.numeric(amount))
+
+long_filtered <- long %>%
+  filter(
+    `Reporting country` == "All reporting countries", 
+    `Counterparty country` == "All countries (total)",
+    `Type of instruments` == "All instruments",
+    `Currency denomination` == "All currencies",
+    `Counterparty sector` == "All sectors",
+    `Measure` == "Amounts outstanding / Stocks",                
+    `Type of reporting institutions` == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)", 
+    `Position type` == "Cross-border",
+    `Currency type of reporting country` == "All currencies (=D+F+U)",
+    `Parent country` == "All countries (total)"
+  )
+}
+
+data_reduced <- data %>%
+  filter(
+    `Reporting country` == "All reporting countries", 
+    `Counterparty country` == "All countries (total)",
+    `Type of instruments` == "All instruments",
+    `Currency denomination` == "All currencies",
+    `Counterparty sector` == "All sectors",  
+    `Measure` == "Amounts outstanding / Stocks",                
+    `Type of reporting institutions` == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)", 
+    `Position type` == "Cross-border",
+    `Currency type of reporting country` == "All currencies (=D+F+U)",
+    `Parent country` == "All countries (total)"
+  ) %>%
+  # CORRECTION ICI : on force l'utilisation de dplyr
+  dplyr::select(all_of(bsp_col), all_of(quarter_cols))
+
+# 3. ET MAINTENANT on pivote (sur un tout petit tableau)
+long_filtered <- data_reduced %>%
+  pivot_longer(
+    cols = all_of(quarter_cols), 
+    names_to = "period", 
+    values_to = "amount"
+  ) %>%
+  mutate(amount = as.numeric(amount))
+
+# verification (ie 'total claims', 'total liabilities')
+bsp_values <- unique(na.omit(long[[bsp_col]]))
+cat("Found BSP column:", bsp_col, "\nValues:", paste(head(bsp_values, 10), collapse = ", "), "\n")
+
+# stat descr par periode et BSP value
+stats_tbl <- long %>%
+  filter(!is.na(amount)) %>%
+  mutate(bsp = .data[[bsp_col]],
+         amount_bn = amount / 1000) %>% # conversion en Md ici
+  group_by(period, bsp) %>%
+  summarise(
+    n = n(),
+    mean = mean(amount_bn, na.rm = TRUE),
+    median = median(amount_bn, na.rm = TRUE),
+    min = min(amount_bn, na.rm = TRUE),
+    max = max(amount_bn, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(period, bsp)
+
+# affichage table 
+if(nrow(stats_tbl) > 0) {
+  knitr::kable(stats_tbl, digits = 2, caption = "Stats descr. par trimestre (en milliards USD)") %>%
+    kableExtra::kable_styling(full_width = FALSE)
+}
+
+# graphe
+if(nrow(long_filtered) > 0) {
+  totals_tbl <- long_filtered %>%
+    filter(!is.na(amount)) %>%
+    mutate(bsp = .data[[bsp_col]]) %>%
+    group_by(period, bsp) %>%
+    summarise(total_bn = sum(amount, na.rm = TRUE) / 1000, .groups = "drop") %>%
+    arrange(period)
+
+  periods_sorted <- sort(unique(totals_tbl$period))
+  totals_tbl <- totals_tbl %>% mutate(period = factor(period, levels = periods_sorted))
+
+  # axe X : affichage de ticks tous les 5 ans
+  years_all <- as.integer(sub("-Q.*$", "", periods_sorted))
+  label_years <- seq(floor(min(years_all)/5)*5, max(years_all), by = 5)
+  tick_periods <- vapply(label_years, function(y) {
+    p1 <- paste0(y, "-Q1"); if(p1 %in% periods_sorted) return(p1)
+    p_any <- periods_sorted[grep(paste0("^", y, "-Q"), periods_sorted)]
+    return(if(length(p_any) > 0) p_any[1] else NA_character_)
+  }, FUN.VALUE = "")
+  tick_periods <- tick_periods[!is.na(tick_periods) & tick_periods != ""]
+
+  totals_tbl <- totals_tbl %>%
+  mutate(bsp = case_when(
+    grepl("claims", bsp, ignore.case = TRUE) ~ "Créances",
+    grepl("liabilities", bsp, ignore.case = TRUE) ~ "Engagements",
+    TRUE ~ bsp # garde  le nom d'origine sinon
+  ))
+  
+  gg_total <- ggplot(totals_tbl, aes(x = period, y = total_bn, color = bsp, group = bsp)) +
+    geom_line(linewidth = 1) + scale_color_manual(values = c("Créances" = "#003399", "Engagements" = "#1E90FF")) +
+    scale_y_continuous(labels = scales::label_comma(suffix = " Md")) +
+    scale_x_discrete(breaks = tick_periods, labels = substring(tick_periods, 1, 4)) +
+    theme_minimal() +
+    labs(x = "Année", y = "Total (en milliards de dollars)", color = "Position")
+  print(gg_total)       #lignes continues
+  ggsave("overall_trends.pdf", width = 10, height = 5)
+
+	# resumes globaux des totaux par trim: moyenne, median, mode, sd, min, max, n_periodes
+	summary_totals <- totals_tbl %>%
+    group_by(bsp) %>%
+    summarise(
+      n_trimestres = n(),
+      moyenne = mean(total_bn, na.rm = TRUE),
+      mediane = median(total_bn, na.rm = TRUE),
+      ecart_type = sd(total_bn, na.rm = TRUE),
+      min = min(total_bn, na.rm = TRUE),
+      max = max(total_bn, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  knitr::kable(summary_totals, digits = 2, caption = "Résumé global des totaux trimestriels (en milliards USD)") %>%
+    kableExtra::kable_styling(full_width = FALSE)
+
+  detailed_totals_tbl <- totals_tbl %>%
+    group_by(bsp) %>%
+    summarise(
+      Min = min(total_bn),
+      Q1 = quantile(total_bn, 0.25),
+      Mediane = median(total_bn),
+      Moyenne = mean(total_bn),
+      Q3 = quantile(total_bn, 0.75),
+      Max = max(total_bn),
+      SD = sd(total_bn),
+      .groups = "drop"
+    )
+
+  knitr::kable(detailed_totals_tbl, digits = 2, caption = "Résumé détaillé par BSP (Milliards USD)") %>%
+    kableExtra::kable_styling(full_width = FALSE)
+
+  stats_for_annot <- totals_tbl %>%
+    group_by(bsp) %>%
+    summarise(
+      med = median(total_bn, na.rm = TRUE),
+      mean = mean(total_bn, na.rm = TRUE),
+      maxv = max(total_bn, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  gg_box <- ggplot(totals_tbl, aes(x = bsp, y = total_bn, fill = bsp)) +
+    geom_boxplot(alpha = 0.7) +
+    stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "black") +
+    # Ajout du texte au-dessus des boîtes
+    geom_text(data = stats_for_annot, 
+              aes(x = bsp, y = maxv * 1.05, label = paste0("med=", round(med, 1), "\nmoy=", round(mean, 1))),
+              size = 3, vjust = 0, lineheight = 0.8) +
+    scale_y_continuous(labels = scales::label_comma(suffix = " Md"), expand = expansion(mult = c(0.1, 0.15))) +
+    labs(title = "Distribution globale des montants", x = "Position au bilan", y = "Montant (milliards USD)") +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+  print(gg_box)
+
+  # --- TABLEAU FINAL ---
+  last_4_periods <- tail(periods_sorted, 4)
+  table_final <- totals_tbl %>%
+    filter(period %in% last_4_periods) %>%
+    mutate(`Total (Milliards USD)` = round(total_bn, 2)) %>%
+    dplyr::select(period, bsp, `Total (Milliards USD)`)
+
+  knitr::kable(table_final, caption = "Focus : 4 derniers trimestres (en milliards USD)", align = "c")
+}
+```
+
+--- Stats descrp : secteur de contrepartie ---
+```{r Secteur contrepartie}
+quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
+bsp_col <- names(data)[grepl("Balance.*sheet.*position|Balance.*position", names(data), ignore.case = TRUE)][1]
+
+custom_colors <- c(
+  "Banks, total" = "#1E90FF",                 
+  "Non-bank financial institutions" = "#003399", 
+  "Non-financial sectors" = "#28B463",       
+  "Non-banks, total" = "#A04000",             
+  "Unallocated non-financial sectors" = "#F1C40F",
+  "Unallocated by sector" = "#95A5A6"       
+)
+
+# ordre d'empilement (bas vers haut)
+final_stack_order <- c(
+  "Banks, total",
+  "Non-bank financial institutions",
+  "Non-financial sectors",
+  "Non-banks, total",
+  "Unallocated non-financial sectors",
+  "Unallocated by sector"              
+)
+
+# prep
+df_reduced_wide <- data %>%
+  filter(
+    `Reporting country` == "All reporting countries", 
+    `Counterparty country` == "All countries (total)",
+    `Type of instruments` == "All instruments",
+    `Currency denomination` == "All currencies",
+    `Measure` == "Amounts outstanding / Stocks",                
+    `Type of reporting institutions` == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)", 
+    `Position type` == "Cross-border",
+    `Currency type of reporting country` == "All currencies (=D+F+U)",
+    `Parent country` == "All countries (total)",
+    `Counterparty sector` %in% names(custom_colors)
+  ) %>%
+  dplyr::select(all_of(bsp_col), `Counterparty sector`, all_of(quarter_cols))
+
+df_sectors <- df_reduced_wide %>%
+  pivot_longer(cols = all_of(quarter_cols), names_to = "period", values_to = "amount") %>%
+  mutate(amount = as.numeric(amount)) %>%
+  filter(!is.na(amount))
+
+# filtre à partir de 2013 (chgt méthodo)
+df_sectors <- df_sectors %>%
+  filter(!(`Counterparty sector` == "Non-banks, total" & period > "2013-Q3"))
+
+# mirroir
+
+df_mirror <- df_sectors %>%
+  mutate(
+    type = case_when(
+      grepl("claims", .data[[bsp_col]], ignore.case = TRUE) ~ "Créances",
+      grepl("liabilities", .data[[bsp_col]], ignore.case = TRUE) ~ "Engagements",
+      TRUE ~ "Autre"
+    ),
+    val_bn = amount / 1000,
+    val_plot = ifelse(type == "Engagements", -val_bn, val_bn)
+  )
+
+# transforme la colonne en facteur avec les niveaux explicites.
+df_mirror$`Counterparty sector` <- factor(
+  df_mirror$`Counterparty sector`, 
+  levels = final_stack_order
+)
+
+# arrange aussi le tableau pour être sûr que ggplot lise dans le bon ordre
+df_mirror <- df_mirror %>%
+  arrange(period, `Counterparty sector`) %>%
+  mutate(period = factor(period, levels = unique(period)))
+
+# enveloppe
+df_envelope <- df_mirror %>%
+  group_by(period, type) %>%
+  summarise(
+    total_val = sum(val_bn, na.rm = TRUE),
+    plot_val = ifelse(first(type) == "Engagements", -sum(val_bn, na.rm = TRUE), sum(val_bn, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# ticks
+all_periods <- levels(df_mirror$period)
+if(length(all_periods) > 0) {
+  tick_indices <- seq(1, length(all_periods), length.out = 10) 
+  ticks_labels <- all_periods[tick_indices]
+} else {
+  ticks_labels <- character(0)
+}
+
+max_y <- max(df_envelope$total_val, na.rm = TRUE)
+pos_creances <- max_y / 2
+pos_engagements <- -max_y / 2
+
+p <- ggplot() +
+  # width = 0.98 pour des barres larges
+  geom_bar(data = df_mirror, aes(x = period, y = val_plot, fill = `Counterparty sector`), 
+           stat = "identity", width = 0.98, color = NA) + 
+  
+  geom_line(data = df_envelope, aes(x = period, y = plot_val, group = type), 
+            color = "black", linewidth = 0.5) +
+  
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.1, alpha = 0.3) +
+  
+  scale_y_continuous(labels = function(x) paste0(abs(x), " Md"),
+                     sec.axis = sec_axis(
+      trans = ~ ., # même échelle
+      breaks = c(pos_creances, pos_engagements),
+      labels = c("CRÉANCES", "ENGAGEMENTS") 
+    )) +
+  scale_x_discrete(breaks = ticks_labels, labels = substring(ticks_labels, 1, 4)) +
+  
+  scale_fill_manual(
+    values = custom_colors,
+    labels = c(
+      "Banks, total"                      = "Banques (Total)",
+      "Non-bank financial institutions"   = "NBFI",
+      "Non-financial sectors"             = "Secteurs non financiers",
+      "Non-banks, total"                  = "Secteur non bancaire (Total)",
+      "Unallocated by sector"             = "Non alloué par secteur",
+      "Unallocated non-financial sectors" = "Secteurs non fi. non alloués"
+    )
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(color = "gray30", margin = ggplot2::margin(b = 10)),
+    legend.position = "right", 
+    legend.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(), 
+    panel.grid.minor = element_blank(),
+    
+    axis.text.y.right = element_text(
+      angle = 270,          
+      hjust = 0.5,          
+      vjust = 0.5,          
+      size = 12,            
+      color = "black",     
+      face = "bold"
+    ),
+    
+    axis.ticks.y.right = element_blank(),
+    axis.line.y.right = element_blank()
+  ) +
+  labs(
+    x = "Année",
+    y = "Montants (en milliards de dollars)",
+    fill = "Secteur de\ncontrepartie"
+  )
+
+print(p)
+# ggsave("graphique_secteur_contrepartie.pdf", plot = p, width = 17, height = 7, dpi = 300)
+
+summary_table <- df_sectors %>%
+  # 1. Filtre temporel et sectoriel
+  filter(period >= "2013-Q4") %>%
+  filter(`Counterparty sector` %in% c("Banks, total", "Non-bank financial institutions")) %>%
+  
+  # 2. ÉTAPE CLÉ : On additionne les montants (Créances + Engagements) par date et secteur
+  # Cela évite l'erreur de duplication et supprime le besoin de 'select'
+  group_by(period, `Counterparty sector`) %>%
+  summarise(val_bn = sum(as.numeric(amount), na.rm = TRUE) / 1000, .groups = "drop") %>%
+  
+  # 3. Pivot (maintenant ça marche car il n'y a qu'une seule valeur par case)
+  pivot_wider(names_from = `Counterparty sector`, values_from = val_bn) %>%
+  
+  # 4. Renommer pour faire propre
+  rename(
+    "Période" = period,
+    "Banques (Total)" = `Banks, total`,
+    "NBFI" = `Non-bank financial institutions`
+  )
+
+# Affichage du tableau
+print(as.data.frame(summary_table))
+```	
+
+--- Stats descrp : Type d'instruments ---
+```{r Instruments}
+# meme logique secteur de contrepartie avec filtre à partir de 2014
+quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
+bsp_col <- names(data)[grepl("Balance.*sheet.*position|Balance.*position", names(data), ignore.case = TRUE)][1]
+
+custom_colors <- c(
+  "Loans and deposits" = "#1E90FF",                 
+  "Debt securities" = "#003399", 
+  "Derivatives and Other instruments" = "#28B463",       
+  "Unallocated by instrument" = "#95A5A6"       
+)
+
+# ordre d'empilement (bas vers haut)
+final_stack_order <- c(
+  "Loans and deposits",
+  "Debt securities",
+  "Derivatives and Other instruments",
+  "Unallocated by instrument"              
+)
+
+# prep
+df_reduced_wide <- data %>%
+  filter(
+    `Reporting country` == "All reporting countries", 
+    `Counterparty country` == "All countries (total)",
+    `Type of instruments` %in% names(custom_colors),
+    `Currency denomination` == "All currencies",
+    `Measure` == "Amounts outstanding / Stocks",                
+    `Type of reporting institutions` == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)", 
+    `Position type` == "Cross-border",
+    `Currency type of reporting country` == "All currencies (=D+F+U)",
+    `Parent country` == "All countries (total)",
+    `Counterparty sector` == "All sectors"
+  ) %>%
+  dplyr::select(all_of(bsp_col), `Type of instruments`, all_of(quarter_cols))
+
+df_sectors <- df_reduced_wide %>%
+  pivot_longer(cols = all_of(quarter_cols), names_to = "period", values_to = "amount") %>%
+  mutate(amount = as.numeric(amount)) %>%
+  filter(!is.na(amount))
+
+# filtre à partir de 2014 (chgt méthodo)
+df_sectors <- df_sectors %>%
+  filter((period > "2014-Q1"))
+
+# mirroir
+
+df_mirror <- df_sectors %>%
+  mutate(
+    type = case_when(
+      grepl("claims", .data[[bsp_col]], ignore.case = TRUE) ~ "Créances",
+      grepl("liabilities", .data[[bsp_col]], ignore.case = TRUE) ~ "Engagements",
+      TRUE ~ "Autre"
+    ),
+    val_bn = amount / 1000,
+    val_plot = ifelse(type == "Engagements", -val_bn, val_bn)
+  )
+
+# transforme la colonne en facteur avec les niveaux explicites.
+df_mirror$`Type of instruments` <- factor(
+  df_mirror$`Type of instruments`, 
+  levels = final_stack_order
+)
+
+# arrange aussi le tableau pour être sûr que ggplot lise dans le bon ordre
+df_mirror <- df_mirror %>%
+  arrange(period, `Type of instruments`) %>%
+  mutate(period = factor(period, levels = unique(period)))
+
+# enveloppe
+df_envelope <- df_mirror %>%
+  group_by(period, type) %>%
+  summarise(
+    total_val = sum(val_bn, na.rm = TRUE),
+    plot_val = ifelse(first(type) == "Engagements", -sum(val_bn, na.rm = TRUE), sum(val_bn, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# ticks
+all_periods <- levels(df_mirror$period)
+if(length(all_periods) > 0) {
+  tick_indices <- seq(1, length(all_periods), length.out = 10) 
+  ticks_labels <- all_periods[tick_indices]
+} else {
+  ticks_labels <- character(0)
+}
+
+max_y <- max(df_envelope$total_val, na.rm = TRUE)
+pos_creances <- max_y / 2
+pos_engagements <- -max_y / 2
+
+p <- ggplot() +
+  # width = 0.999 pour des barres larges
+  geom_bar(data = df_mirror, aes(x = period, y = val_plot, fill = `Type of instruments`), 
+           stat = "identity", width = 0.999, color = NA) + 
+  
+  geom_line(data = df_envelope, aes(x = period, y = plot_val, group = type), 
+            color = "black", linewidth = 0.5) +
+  
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.1, alpha = 0.3) +
+  
+  scale_y_continuous(labels = function(x) paste0(abs(x), " Md"),
+                     sec.axis = sec_axis(
+      trans = ~ ., # même échelle
+      breaks = c(pos_creances, pos_engagements),
+      labels = c("CRÉANCES", "ENGAGEMENTS") 
+    )) +
+  scale_x_discrete(breaks = ticks_labels, labels = substring(ticks_labels, 1, 4)) +
+  
+  scale_fill_manual(
+    values = custom_colors,
+    labels = c(
+      "Loans and deposits" = "Prêts et dépôts",
+      "Debt securities" = "Titres de créance",
+      "Derivatives and Other instruments" = "Produits dérivés et autres instruments",
+      "Unallocated by instrument" = "Non alloué par instrument"
+    )
+  ) +
+  
+  guides(fill = guide_legend(ncol = 1)) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(color = "gray30", margin = ggplot2::margin(b = 10)),
+    legend.position = "right", 
+    legend.title = element_text(face = "bold", size = 11), 
+    legend.text = element_text(size = 10),                 
+    legend.key.size = unit(0.7, "cm"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_text(size = 14, margin = ggplot2::margin(t = 10)),
+    panel.grid.major.x = element_blank(), 
+    panel.grid.minor = element_blank(),
+    axis.title.y = element_text(size = 14, margin = ggplot2::margin(r = 10)),
+    
+    axis.text.y.right = element_text(
+      angle = 270,          
+      hjust = 0.5,          
+      vjust = 0.5,          
+      size = 9,            
+      color = "black",     
+      face = "bold"
+    ),
+    
+    axis.ticks.y.right = element_blank(),
+    axis.line.y.right = element_blank()
+  ) +
+  labs(
+    x = "Année",
+    y = "Montants (en milliards de dollars)",
+    fill = "Type d'instrument financier"
+  )
+
+print(p)
+ggsave("graphique_instru_fi.pdf", plot = p, width = 12, height = 8, dpi = 300)
+
+# summary_table <- df_sectors %>%
+#   # 1. Filtre temporel et sectoriel
+#   filter(period >= "2013-Q4") %>%
+#   filter(`Counterparty sector` %in% c("Banks, total", "Non-bank financial institutions")) %>%
+#   
+#   # 2. ÉTAPE CLÉ : On additionne les montants (Créances + Engagements) par date et secteur
+#   # Cela évite l'erreur de duplication et supprime le besoin de 'select'
+#   group_by(period, `Counterparty sector`) %>%
+#   summarise(val_bn = sum(as.numeric(amount), na.rm = TRUE) / 1000, .groups = "drop") %>%
+#   
+#   # 3. Pivot (maintenant ça marche car il n'y a qu'une seule valeur par case)
+#   pivot_wider(names_from = `Counterparty sector`, values_from = val_bn) %>%
+#   
+#   # 4. Renommer pour faire propre
+#   rename(
+#     "Période" = period,
+#     "Banques (Total)" = `Banks, total`,
+#     "NBFI" = `Non-bank financial institutions`
+#   )
+# 
+# # Affichage du tableau
+# print(as.data.frame(summary_table))
+```
+
+--- Stats descrp : monnaie d'échange ---
+```{r Monnaie d'échange}
+# meme logique secteur de contrepartie avec filtre à partir de 2014
+quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
+bsp_col <- names(data)[grepl("Balance.*sheet.*position|Balance.*position", names(data), ignore.case = TRUE)][1]
+
+custom_colors <- c(
+  "Domestic currency" = "#1E90FF",                 
+  "US dollar" = "#003399", 
+  "Euro" = "#28B463",  
+  "Yen" = "#8E44AD",
+  "Pound (sterling)" = "#F1C40F",
+  "Swiss franc" = "#A04000",
+  "Other currencies" = "#95A5A6"       
+)
+
+# ordre d'empilement (bas vers haut)
+final_stack_order <- c(
+  "Domestic currency",                 
+  "US dollar", 
+  "Euro",  
+  "Yen",
+  "Pound (sterling)",
+  "Swiss franc",
+  "Other currencies"           
+)
+
+# prep
+df_reduced_wide <- data %>%
+  filter(
+    `Reporting country` == "All reporting countries", 
+    `Counterparty country` == "All countries (total)",
+    `Type of instruments` == "All instruments",
+    `Measure` == "Amounts outstanding / Stocks",                
+    `Type of reporting institutions` == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)", 
+    `Position type` == "Cross-border",
+    `Parent country` == "All countries (total)",
+    `Counterparty sector` == "All sectors",
+    ((`Currency type of reporting country` == "Domestic currency (ie currency of bank location country)" & `Currency denomination` == "All currencies") |
+    (`Currency denomination` %in% c("US dollar", "Euro", "Yen", "Pound (sterling)", "Swiss franc", "All currencies excl. core") & 
+       `Currency type of reporting country` == "Foreign currency (ie currencies foreign to bank location country)"))
+  ) %>%
+
+mutate(
+    currency_category = case_when(
+      # cas domestique
+      `Currency type of reporting country` == "Domestic currency (ie currency of bank location country)" ~ "Domestic currency",
+      
+      # cas étranger
+      `Currency denomination` == "US dollar" ~ "US dollar",
+      `Currency denomination` == "Euro" ~ "Euro",
+      `Currency denomination` == "Yen" ~ "Yen",
+      `Currency denomination` == "Pound (sterling)" ~ "Pound (sterling)",
+      `Currency denomination` == "Swiss franc" ~ "Swiss franc",
+      `Currency denomination` == "All currencies excl. core" ~ "Other currencies",
+      
+      TRUE ~ "Other currencies" # par sécurité
+    )
+  ) %>%
+  dplyr::select(all_of(bsp_col), currency_category, all_of(quarter_cols))
+
+df_sectors <- df_reduced_wide %>%
+  pivot_longer(cols = all_of(quarter_cols), names_to = "period", values_to = "amount") %>%
+  mutate(amount = as.numeric(amount)) %>%
+  filter(!is.na(amount))
+
+# filtre à partir de 2014 (chgt méthodo)
+df_sectors <- df_sectors %>%
+  filter((period > "2014-Q1"))
+
+# mirroir
+
+df_mirror <- df_sectors %>%
+  mutate(
+    type = case_when(
+      grepl("claims", .data[[bsp_col]], ignore.case = TRUE) ~ "Créances",
+      grepl("liabilities", .data[[bsp_col]], ignore.case = TRUE) ~ "Engagements",
+      TRUE ~ "Autre"
+    ),
+    val_bn = amount / 1000,
+    val_plot = ifelse(type == "Engagements", -val_bn, val_bn)
+  )
+
+# transforme la colonne en facteur avec les niveaux explicites.
+df_mirror$currency_category <- factor(df_mirror$currency_category, levels = final_stack_order)
+
+# arrange aussi le tableau pour être sûr que ggplot lise dans le bon ordre
+df_mirror <- df_mirror %>%
+  arrange(period, currency_category) %>%
+  mutate(period = factor(period, levels = unique(period)))
+
+# enveloppe
+df_envelope <- df_mirror %>%
+  group_by(period, type) %>%
+  summarise(
+    total_val = sum(val_bn, na.rm = TRUE),
+    plot_val = ifelse(first(type) == "Engagements", -sum(val_bn, na.rm = TRUE), sum(val_bn, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# ticks
+all_periods <- levels(df_mirror$period)
+if(length(all_periods) > 0) {
+  tick_indices <- seq(1, length(all_periods), by = 12) 
+  ticks_labels <- all_periods[tick_indices]
+} else {
+  ticks_labels <- character(0)
+}
+
+max_y <- max(df_envelope$total_val, na.rm = TRUE)
+pos_creances <- max_y / 2
+pos_engagements <- -max_y / 2
+
+p <- ggplot() +
+  # width = 0.999 pour des barres larges
+  geom_bar(data = df_mirror, aes(x = period, y = val_plot, fill = currency_category), 
+           stat = "identity", width = 0.999, color = NA) + 
+  
+  geom_line(data = df_envelope, aes(x = period, y = plot_val, group = type), 
+            color = "black", linewidth = 0.5) +
+  
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.1, alpha = 0.3) +
+  
+  scale_y_continuous(labels = function(x) paste0(abs(x), " Md"),
+                     sec.axis = sec_axis(
+      trans = ~ ., # même échelle
+      breaks = c(pos_creances, pos_engagements),
+      labels = c("CRÉANCES", "ENGAGEMENTS") 
+    )) +
+  scale_x_discrete(breaks = ticks_labels, labels = substring(ticks_labels, 1, 4)) +
+  
+  scale_fill_manual(
+    values = custom_colors,
+    labels = c(
+      "Domestic currency"= "Monnaie nationale",
+      "US dollar"        = "Dollar américain",
+      "Euro"             = "Euro",
+      "Yen"              = "Yen",
+      "Pound (sterling)" = "Livre sterling",
+      "Swiss franc"      = "Franc suisse",
+      "Other currencies" = "Autres devises étrangères"
+    )
+  ) +
+  
+  guides(fill = guide_legend(nrow = 2)) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(color = "gray30", margin = ggplot2::margin(b = 10)),
+    legend.position = "bottom", 
+    legend.title = element_text(face = "bold", size = 13), 
+    legend.text = element_text(size = 12),                 
+    legend.key.size = unit(0.7, "cm"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_text(size = 14, margin = ggplot2::margin(t = 10)),
+    panel.grid.major.x = element_blank(), 
+    panel.grid.minor = element_blank(),
+    axis.title.y = element_text(size = 14, margin = ggplot2::margin(r = 10)),
+    
+    axis.text.y.right = element_text(
+      angle = 270,          
+      hjust = 0.5,          
+      vjust = 0.5,          
+      size = 12,            
+      color = "black",     
+      face = "bold"
+    ),
+    
+    axis.ticks.y.right = element_blank(),
+    axis.line.y.right = element_blank()
+  ) +
+  labs(
+    x = "Année",
+    y = "Montants (en milliards de dollars)",
+    fill = "Monnaie d'échange"
+  )
+
+print(p)
+ggsave("graphique_monnaie.pdf", plot = p, width = 13, height = 8, dpi = 300)
+
+# summary_table <- df_sectors %>%
+#   # 1. Filtre temporel et sectoriel
+#   filter(period >= "2013-Q4") %>%
+#   filter(`Counterparty sector` %in% c("Banks, total", "Non-bank financial institutions")) %>%
+#   
+#   # 2. ÉTAPE CLÉ : On additionne les montants (Créances + Engagements) par date et secteur
+#   # Cela évite l'erreur de duplication et supprime le besoin de 'select'
+#   group_by(period, `Counterparty sector`) %>%
+#   summarise(val_bn = sum(as.numeric(amount), na.rm = TRUE) / 1000, .groups = "drop") %>%
+#   
+#   # 3. Pivot (maintenant ça marche car il n'y a qu'une seule valeur par case)
+#   pivot_wider(names_from = `Counterparty sector`, values_from = val_bn) %>%
+#   
+#   # 4. Renommer pour faire propre
+#   rename(
+#     "Période" = period,
+#     "Banques (Total)" = `Banks, total`,
+#     "NBFI" = `Non-bank financial institutions`
+#   )
+# 
+# # Affichage du tableau
+# print(as.data.frame(summary_table))
+```
+
+
+
+

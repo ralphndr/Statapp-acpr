@@ -1,0 +1,12 @@
+── Data Summary ────────────────────────
+                           Values
+Name                       data  
+Number of rows             608020
+Number of columns          223   
+_______________________          
+Column type frequency:           
+  character                29    
+  logical                  2     
+  numeric                  192   
+________________________         
+Group variables            None  
