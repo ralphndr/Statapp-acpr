@@ -1,6 +1,6 @@
 Stat App: ACPR
 
---- First chunk: import libraries nécessaires---
+--- Import des libraries nécessaires---
 ```{r Libraries}
 library(readr)      
 library(janitor)     # cleaning
@@ -29,7 +29,7 @@ library(scales)
 library(stringr)
 ```
 
-```{r aide}
+```{r Aide}
 # aide: description détaillée (déciles, quartiles, moyenne, variance, mode)
 get_mode <- function(x) { ux <- unique(x); ux[which.max(tabulate(match(x, ux)))] }
 compute_detailed_summary <- function(df, group_col, value_col) {
@@ -63,8 +63,7 @@ compute_detailed_summary <- function(df, group_col, value_col) {
 }
 ```
 
-```{r filtre}
-
+```{r Filtre}
 # identification des colonnes (format: "YYYY-Qx")
 quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
 if(length(quarter_cols) == 0) stop("No quarter columns found.")
@@ -106,27 +105,23 @@ check_rows <- long_filtered %>%
 --- premier niveau de resume des donnees + infos de base ---
 ```{r Brève description}
 # data <- read.csv("Locational_Banking_Statistics_for_Stat_App.csv")
-data <- read_csv("/Users/ralphnader/Desktop/Statapp/WS_LBS_D_PUB_csv_col.csv")
-capture.output(skim(data), file = "skim_output.txt")
+data <- read_csv("/Users/ralphnader/Desktop/Github_Projects/Statapp/WS_LBS_D_PUB_csv_col.csv")
+#capture.output(skim(data), file = "skim_output.txt")
 ```
 
-The output shows that our dataset has the following structure:
+On a la structure suivante pour la base de données:
 _______________________
-Number of rows             608020  
-Number of columns          223   
+Nb de lignes               608020  
+Nb de colonnes             223   
 _______________________          
-Column type frequency:           
+Freq du type de colonnes:           
   character                29    
   logical                  2     
   numeric                  192 
 ________________________
 
-After thorough inspection, we quickly notice that only the "character" columns are descriptive variables. The "logical" columns are 
-supposed to be indicators of the time format but will be removed since they are completely empty. Finally, the "numeric" columns are
-time series data which implies that we will need to reformat them in order to use them when plotting time series graphs.
-
---- Data cleaning and preprocessing ---
-```{r valeurs manquantes}
+--- Nettoyage des données et preprocess ---
+```{r Valeurs manquantes}
 # valeurs manquantes par col
 missing_by_var <- data %>%
 	summarise(across(everything(), ~ sum(is.na(.)))) %>%
@@ -140,21 +135,8 @@ knitr::kable(missing_by_var, digits = c(0, 2), caption = "Missing values per var
 
 write.csv(missing_by_var, "missing_summary.csv", row.names = FALSE)
 ```
-
-From the table returned, we can identify different scenarios depending on the variable:
-- Variables with 100% missing values: both 'TIME_FORMAT' & 'Time.Format' can be removed from our dataset.
-- Variables with no missing values at all: basically every descriptive variable which is reassuring since it means
-we will not have to fill them using some imputation method (e.g. mean, median, mode, etc.).
-- Variables with partial missing values: time series columns are the ones concerend here. One observation that can be made
-is that the more recent the year, the less missing values there are (for instance, we go from ~87% missing values in the first years
-covered by the database - around 1978- to ~21% in the most recent year - 2022). Note that this is a pretty progressive tendency except 2
-jumps of ~10% in 1995 and 2013.
-
--> This increase in data completeness over time could have several interpretations depending on its root cause:
-    1) Changes in data reporting and/or collection practices.
-    2) Increased activity: more actors have been participating lately compared ti the early 80s.
     
-```{r series temp manquant}
+```{r Series temporelles manquantes}
 missing_pct <- colMeans(is.na(data[quarter_cols])) * 100
 
 plot_data <- data.frame(
@@ -198,13 +180,13 @@ if(length(present) == 0) {
 cat("Database shape:", dim(data)[1], ",", dim(data)[2], "\n")
 ```
 
-When running this cell, we get:
+Après avoir lancé la cellule précédente,on obtient:
         1) Database shape: 608020 , 223 
         2) Database shape: 608020 , 221 
-which confirms that the two columns have been removed successfully.
+ce qui confirme la suppression des deux colonnes (comme souhaité).
 
---- Stats descrp ---
-```{r Stats descrp}
+--- Statistiques descriptives ---
+```{r Stats descriptives : tendances générales}
 quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
 bsp_col <- names(data)[grepl("Balance.*sheet.*position|Balance.*position", names(data), ignore.case = TRUE)][1]
 
@@ -510,19 +492,23 @@ p <- ggplot() +
   
   theme_minimal(base_size = 12) +
   theme(
-    plot.title = element_text(face = "bold", size = 16),
+    plot.title = element_text(face = "bold", size = 20),
     plot.subtitle = element_text(color = "gray30", margin = ggplot2::margin(b = 10)),
     legend.position = "right", 
-    legend.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold", size = 18),
+    legend.text = element_text(size = 18),                 
+    legend.key.size = unit(0.7, "cm"),
     axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_text(size = 20, margin = ggplot2::margin(t = 10)),
     panel.grid.major.x = element_blank(), 
     panel.grid.minor = element_blank(),
+    axis.title.y = element_text(size = 20, margin = ggplot2::margin(b = 10)),
     
     axis.text.y.right = element_text(
       angle = 270,          
       hjust = 0.5,          
       vjust = 0.5,          
-      size = 12,            
+      size = 18,            
       color = "black",     
       face = "bold"
     ),
@@ -537,29 +523,20 @@ p <- ggplot() +
   )
 
 print(p)
-# ggsave("graphique_secteur_contrepartie.pdf", plot = p, width = 17, height = 7, dpi = 300)
+ggsave("graphique_secteur_contrepartie.pdf", plot = p, width = 17, height = 7, dpi = 300)
 
 summary_table <- df_sectors %>%
-  # 1. Filtre temporel et sectoriel
   filter(period >= "2013-Q4") %>%
   filter(`Counterparty sector` %in% c("Banks, total", "Non-bank financial institutions")) %>%
-  
-  # 2. ÉTAPE CLÉ : On additionne les montants (Créances + Engagements) par date et secteur
-  # Cela évite l'erreur de duplication et supprime le besoin de 'select'
   group_by(period, `Counterparty sector`) %>%
   summarise(val_bn = sum(as.numeric(amount), na.rm = TRUE) / 1000, .groups = "drop") %>%
-  
-  # 3. Pivot (maintenant ça marche car il n'y a qu'une seule valeur par case)
   pivot_wider(names_from = `Counterparty sector`, values_from = val_bn) %>%
-  
-  # 4. Renommer pour faire propre
   rename(
     "Période" = period,
     "Banques (Total)" = `Banks, total`,
     "NBFI" = `Non-bank financial institutions`
   )
-
-# Affichage du tableau
+# affichage
 print(as.data.frame(summary_table))
 ```	
 
@@ -607,7 +584,7 @@ df_sectors <- df_reduced_wide %>%
 
 # filtre à partir de 2014 (chgt méthodo)
 df_sectors <- df_sectors %>%
-  filter((period > "2014-Q1"))
+  filter((period >= "2014-Q1"))
 
 # mirroir
 
@@ -645,8 +622,8 @@ df_envelope <- df_mirror %>%
 # ticks
 all_periods <- levels(df_mirror$period)
 if(length(all_periods) > 0) {
-  tick_indices <- seq(1, length(all_periods), length.out = 10) 
-  ticks_labels <- all_periods[tick_indices]
+  q1_only <- all_periods[grepl("-Q1$", all_periods)]
+  ticks_labels <- q1_only[seq(1, length(q1_only), by = 3)]
 } else {
   ticks_labels <- character(0)
 }
@@ -683,27 +660,28 @@ p <- ggplot() +
     )
   ) +
   
-  guides(fill = guide_legend(ncol = 1)) +
+  guides(fill = guide_legend(nrow = 2)) +
   
   theme_minimal(base_size = 12) +
   theme(
-    plot.title = element_text(face = "bold", size = 16),
+    plot.title = element_text(face = "bold", size = 20),
     plot.subtitle = element_text(color = "gray30", margin = ggplot2::margin(b = 10)),
-    legend.position = "right", 
-    legend.title = element_text(face = "bold", size = 11), 
-    legend.text = element_text(size = 10),                 
+    legend.position = "bottom", 
+    legend.title = element_text(face = "bold", size = 20), 
+    legend.text = element_text(size = 20),                 
     legend.key.size = unit(0.7, "cm"),
     axis.text.x = element_text(angle = 45, hjust = 1),
-    axis.title.x = element_text(size = 14, margin = ggplot2::margin(t = 10)),
+    axis.title.x = element_text(size = 20, margin = ggplot2::margin(t = 10)),
+    axis.ticks.length.x = unit(0.25, "cm"),
     panel.grid.major.x = element_blank(), 
     panel.grid.minor = element_blank(),
-    axis.title.y = element_text(size = 14, margin = ggplot2::margin(r = 10)),
+    axis.title.y = element_text(size = 20, margin = ggplot2::margin(r = 10)),
     
     axis.text.y.right = element_text(
       angle = 270,          
       hjust = 0.5,          
       vjust = 0.5,          
-      size = 9,            
+      size = 18,            
       color = "black",     
       face = "bold"
     ),
@@ -718,30 +696,23 @@ p <- ggplot() +
   )
 
 print(p)
-ggsave("graphique_instru_fi.pdf", plot = p, width = 12, height = 8, dpi = 300)
+# ggsave("graphique_instru_fi.pdf", plot = p, width = 12, height = 8, dpi = 300)
 
-# summary_table <- df_sectors %>%
-#   # 1. Filtre temporel et sectoriel
-#   filter(period >= "2013-Q4") %>%
-#   filter(`Counterparty sector` %in% c("Banks, total", "Non-bank financial institutions")) %>%
-#   
-#   # 2. ÉTAPE CLÉ : On additionne les montants (Créances + Engagements) par date et secteur
-#   # Cela évite l'erreur de duplication et supprime le besoin de 'select'
-#   group_by(period, `Counterparty sector`) %>%
-#   summarise(val_bn = sum(as.numeric(amount), na.rm = TRUE) / 1000, .groups = "drop") %>%
-#   
-#   # 3. Pivot (maintenant ça marche car il n'y a qu'une seule valeur par case)
-#   pivot_wider(names_from = `Counterparty sector`, values_from = val_bn) %>%
-#   
-#   # 4. Renommer pour faire propre
-#   rename(
-#     "Période" = period,
-#     "Banques (Total)" = `Banks, total`,
-#     "NBFI" = `Non-bank financial institutions`
-#   )
-# 
-# # Affichage du tableau
-# print(as.data.frame(summary_table))
+summary_table <- df_sectors %>%
+  filter(period >= "2014-Q1") %>%
+  group_by(period, `Type of instruments`) %>%
+  summarise(val_bn = sum(as.numeric(amount), na.rm = TRUE) / 1000, .groups = "drop") %>%
+  pivot_wider(names_from = `Type of instruments`, values_from = val_bn) %>%
+  rename(
+    "Période" = period,
+    "Prêts et dépôts" = "Loans and deposits",
+    "Titres de créance" = "Debt securities",
+    "Produits dérivés et autres instruments" = "Derivatives and Other instruments",
+    "Non alloué par instrument" = "Unallocated by instrument"
+  )
+
+# affichage
+print(as.data.frame(summary_table))
 ```
 
 --- Stats descrp : monnaie d'échange ---
@@ -847,8 +818,8 @@ df_envelope <- df_mirror %>%
 # ticks
 all_periods <- levels(df_mirror$period)
 if(length(all_periods) > 0) {
-  tick_indices <- seq(1, length(all_periods), by = 12) 
-  ticks_labels <- all_periods[tick_indices]
+  q1_only <- all_periods[grepl("-Q1$", all_periods)]
+  ticks_labels <- q1_only[seq(1, length(q1_only), by = 3)]
 } else {
   ticks_labels <- character(0)
 }
@@ -892,23 +863,24 @@ p <- ggplot() +
   
   theme_minimal(base_size = 12) +
   theme(
-    plot.title = element_text(face = "bold", size = 16),
+    plot.title = element_text(face = "bold", size = 20),
     plot.subtitle = element_text(color = "gray30", margin = ggplot2::margin(b = 10)),
     legend.position = "bottom", 
-    legend.title = element_text(face = "bold", size = 13), 
-    legend.text = element_text(size = 12),                 
+    legend.title = element_text(face = "bold", size = 20), 
+    legend.text = element_text(size = 20),                 
     legend.key.size = unit(0.7, "cm"),
     axis.text.x = element_text(angle = 45, hjust = 1),
-    axis.title.x = element_text(size = 14, margin = ggplot2::margin(t = 10)),
+    axis.title.x = element_text(size = 20, margin = ggplot2::margin(t = 10)),
+    axis.ticks.length.x = unit(0.25, "cm"),
     panel.grid.major.x = element_blank(), 
     panel.grid.minor = element_blank(),
-    axis.title.y = element_text(size = 14, margin = ggplot2::margin(r = 10)),
+    axis.title.y = element_text(size = 20, margin = ggplot2::margin(r = 10)),
     
     axis.text.y.right = element_text(
       angle = 270,          
       hjust = 0.5,          
       vjust = 0.5,          
-      size = 12,            
+      size = 18,            
       color = "black",     
       face = "bold"
     ),
@@ -923,7 +895,7 @@ p <- ggplot() +
   )
 
 print(p)
-ggsave("graphique_monnaie.pdf", plot = p, width = 13, height = 8, dpi = 300)
+ggsave("graphique_monnaie.pdf", plot = p, width = 12, height = 8, dpi = 300)
 
 # summary_table <- df_sectors %>%
 #   # 1. Filtre temporel et sectoriel
