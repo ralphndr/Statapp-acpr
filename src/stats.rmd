@@ -102,7 +102,7 @@ check_rows <- long_filtered %>%
   
 ```
 
---- premier niveau de resume des donnees + infos de base ---
+--- Premier niveau de résumé des données + infos de base ---
 ```{r Brève description}
 # data <- read.csv("Locational_Banking_Statistics_for_Stat_App.csv")
 data <- read_csv("/Users/ralphnader/Desktop/Github_Projects/Statapp/WS_LBS_D_PUB_csv_col.csv")
@@ -540,7 +540,7 @@ summary_table <- df_sectors %>%
 print(as.data.frame(summary_table))
 ```	
 
---- Stats descrp : Type d'instruments ---
+--- Stats descrp : type d'instruments financiers---
 ```{r Instruments}
 # meme logique secteur de contrepartie avec filtre à partir de 2014
 quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
@@ -895,30 +895,26 @@ p <- ggplot() +
   )
 
 print(p)
-ggsave("graphique_monnaie.pdf", plot = p, width = 12, height = 8, dpi = 300)
+# ggsave("graphique_monnaie.pdf", plot = p, width = 12, height = 8, dpi = 300)
 
-# summary_table <- df_sectors %>%
-#   # 1. Filtre temporel et sectoriel
-#   filter(period >= "2013-Q4") %>%
-#   filter(`Counterparty sector` %in% c("Banks, total", "Non-bank financial institutions")) %>%
-#   
-#   # 2. ÉTAPE CLÉ : On additionne les montants (Créances + Engagements) par date et secteur
-#   # Cela évite l'erreur de duplication et supprime le besoin de 'select'
-#   group_by(period, `Counterparty sector`) %>%
-#   summarise(val_bn = sum(as.numeric(amount), na.rm = TRUE) / 1000, .groups = "drop") %>%
-#   
-#   # 3. Pivot (maintenant ça marche car il n'y a qu'une seule valeur par case)
-#   pivot_wider(names_from = `Counterparty sector`, values_from = val_bn) %>%
-#   
-#   # 4. Renommer pour faire propre
-#   rename(
-#     "Période" = period,
-#     "Banques (Total)" = `Banks, total`,
-#     "NBFI" = `Non-bank financial institutions`
-#   )
-# 
-# # Affichage du tableau
-# print(as.data.frame(summary_table))
+summary_table_monnaies <- df_sectors %>%
+  filter(period >= "2014-Q1") %>%
+  group_by(period, currency_category) %>%
+  summarise(val_bn = sum(as.numeric(amount), na.rm = TRUE) / 1000, .groups = "drop") %>%
+  pivot_wider(names_from = currency_category, values_from = val_bn) %>%
+  rename(
+    "Période" = period,
+    "Monnaie nationale" = "Domestic currency",
+    "Dollar américain" = "US dollar",
+    "Euro" = "Euro",
+    "Yen" = "Yen",
+    "Livre sterling" = "Pound (sterling)",
+    "Franc suisse" = "Swiss franc",
+    "Autres devises étrangères" = "Other currencies"
+  )
+
+# affichage
+print(as.data.frame(summary_table_monnaies))
 ```
 
 
