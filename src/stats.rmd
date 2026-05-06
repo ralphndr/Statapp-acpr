@@ -1,19 +1,25 @@
-Stat App: ACPR
+---
+title: "Stat App: ACPR"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+---
 
 --- Import des libraries nécessaires---
 ```{r Libraries}
-library(readr)      
+library(readr)
 library(janitor)     # cleaning
-library(dplyr)     
-library(tidyr)       # reshaping 
+library(dplyr)
+library(tidyr)       # reshaping
 library(skimr)       # data summary
-library(summarytools) 
+library(summarytools)
 library(Hmisc)       # advanced stats
-library(stats)    
+library(stats)
 library(car)         # ANOVA, regression diagnostics
 library(psych)       # descriptive stats, corr
 library(MASS)        # distrib
-library(lmtest)      # regression tests 
+library(lmtest)      # regression tests
 library(sandwich)    # robust standard errors
 library(multcomp)    # post-hoc tests
 library(lme4)        # mixed models
@@ -22,45 +28,56 @@ library(randomForest)
 library(e1071)       # SVMs, Naive Bayes
 library(cluster)     # clustering
 library(factoextra)  # PCA
-library(knitr)       
-library(kableExtra) 
-library(rmarkdown)  
+library(knitr)
+library(kableExtra)
+library(rmarkdown)
 library(scales)
 library(stringr)
+library(ggplot2)
+library(lubridate)
 ```
 
 ```{r Aide}
-# aide: description détaillée (déciles, quartiles, moyenne, variance, mode)
 get_mode <- function(x) { ux <- unique(x); ux[which.max(tabulate(match(x, ux)))] }
 compute_detailed_summary <- function(df, group_col, value_col) {
-	df %>%
-		group_by(!!rlang::sym(group_col)) %>%
-		summarise(
-			n = sum(!is.na(.data[[value_col]])),
-			min = min(.data[[value_col]], na.rm = TRUE),
-			p01 = quantile(.data[[value_col]], 0.01, na.rm = TRUE),
-			p05 = quantile(.data[[value_col]], 0.05, na.rm = TRUE),
-			p10 = quantile(.data[[value_col]], 0.10, na.rm = TRUE),
-			p20 = quantile(.data[[value_col]], 0.20, na.rm = TRUE),
-			p25 = quantile(.data[[value_col]], 0.25, na.rm = TRUE),
-			p30 = quantile(.data[[value_col]], 0.30, na.rm = TRUE),
-			p40 = quantile(.data[[value_col]], 0.40, na.rm = TRUE),
-			p50 = quantile(.data[[value_col]], 0.50, na.rm = TRUE),
-			p60 = quantile(.data[[value_col]], 0.60, na.rm = TRUE),
-			p70 = quantile(.data[[value_col]], 0.70, na.rm = TRUE),
-			p75 = quantile(.data[[value_col]], 0.75, na.rm = TRUE),
-			p80 = quantile(.data[[value_col]], 0.80, na.rm = TRUE),
-			p90 = quantile(.data[[value_col]], 0.90, na.rm = TRUE),
-			p95 = quantile(.data[[value_col]], 0.95, na.rm = TRUE),
-			p99 = quantile(.data[[value_col]], 0.99, na.rm = TRUE),
-			mean = mean(.data[[value_col]], na.rm = TRUE),
-			variance = var(.data[[value_col]], na.rm = TRUE),
-			sd = sd(.data[[value_col]], na.rm = TRUE),
-			mode = get_mode(.data[[value_col]]),
-			max = max(.data[[value_col]], na.rm = TRUE),
-			.groups = "drop"
-		)
+  df %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(
+      across(
+        all_of(value_col),
+        list(
+          n        = function(x) sum(!is.na(x)),
+          min      = function(x) min(x, na.rm = TRUE),
+          p01      = function(x) quantile(x, 0.01, na.rm = TRUE),
+          p05      = function(x) quantile(x, 0.05, na.rm = TRUE),
+          p10      = function(x) quantile(x, 0.10, na.rm = TRUE),
+          p20      = function(x) quantile(x, 0.20, na.rm = TRUE),
+          p25      = function(x) quantile(x, 0.25, na.rm = TRUE),
+          p30      = function(x) quantile(x, 0.30, na.rm = TRUE),
+          p40      = function(x) quantile(x, 0.40, na.rm = TRUE),
+          p50      = function(x) quantile(x, 0.50, na.rm = TRUE),
+          p60      = function(x) quantile(x, 0.60, na.rm = TRUE),
+          p70      = function(x) quantile(x, 0.70, na.rm = TRUE),
+          p75      = function(x) quantile(x, 0.75, na.rm = TRUE),
+          p80      = function(x) quantile(x, 0.80, na.rm = TRUE),
+          p90      = function(x) quantile(x, 0.90, na.rm = TRUE),
+          p95      = function(x) quantile(x, 0.95, na.rm = TRUE),
+          p99      = function(x) quantile(x, 0.99, na.rm = TRUE),
+          mean     = function(x) mean(x, na.rm = TRUE),
+          variance = function(x) var(x, na.rm = TRUE),
+          sd       = function(x) sd(x, na.rm = TRUE),
+          mode     = function(x) get_mode(x),
+          max      = function(x) max(x, na.rm = TRUE)
+        )
+      ),
+      .groups = "drop"
+    )
 }
+```
+
+--- Premier niveau de résumé des données + infos de base ---
+```{r breve_description}
+data <- read_csv("/Users/ralphnader/Desktop/Github_Projects/Statapp/data/WS_LBS_D_PUB_csv_col.csv")
 ```
 
 ```{r Filtre}
@@ -70,43 +87,36 @@ if(length(quarter_cols) == 0) stop("No quarter columns found.")
 
 # Case-insensitive partial match -> locate the desired col
 bsp_col <- names(data)[grepl("Balance.*sheet.*position|Balance.*position", names(data), ignore.case = TRUE)]
-if(length(bsp_col) == 0) {
-	stop("Couldn't find the targeted column.")
-}
+if(length(bsp_col) == 0) stop("Couldn't find the targeted column.")
 bsp_col <- bsp_col[1]
 
-# Pivot to long format + keep descriptive cols
-long <- data %>%
-  pivot_longer(cols = all_of(quarter_cols), names_to = "period", values_to = "amount") %>%
-  mutate(amount = as.numeric(amount))
-
-long_filtered <- long %>%
+# Filter in wide format first (avoids pivoting 608K x 192 cols at once)
+data_filtered_wide <- data %>%
   filter(
-    `Reporting country` == "All reporting countries", 
+    `Reporting country` == "All reporting countries",
     `Counterparty country` == "All countries (total)",
     `Type of instruments` == "All instruments",
     `Currency denomination` == "All currencies",
     `Counterparty sector` == "All sectors",
-    `Measure` == "Amounts outstanding / Stocks",                
-    `Type of reporting institutions` == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)", 
+    `Measure` == "Amounts outstanding / Stocks",
+    `Type of reporting institutions` == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)",
     `Position type` == "Cross-border",
     `Currency type of reporting country` == "All currencies (=D+F+U)",
     `Parent country` == "All countries (total)"
   )
 
-check_rows <- long_filtered %>% 
-  group_by(period, `Balance sheet position`) %>% 
+# Now pivot only the small filtered subset
+long_filtered <- data_filtered_wide %>%
+  pivot_longer(cols = all_of(quarter_cols), names_to = "period", values_to = "amount") %>%
+  mutate(amount = as.numeric(amount))
+
+long <- long_filtered
+
+check_rows <- long_filtered %>%
+  group_by(period, .data[[bsp_col]]) %>%
   tally()
 
- print(check_rows)
-  
-```
-
---- Premier niveau de résumé des données + infos de base ---
-```{r Brève description}
-# data <- read.csv("Locational_Banking_Statistics_for_Stat_App.csv")
-data <- read_csv("/Users/ralphnader/Desktop/Github_Projects/Statapp/WS_LBS_D_PUB_csv_col.csv")
-#capture.output(skim(data), file = "skim_output.txt")
+print(check_rows)
 ```
 
 On a la structure suivante pour la base de données:
@@ -186,7 +196,7 @@ Après avoir lancé la cellule précédente,on obtient:
 ce qui confirme la suppression des deux colonnes (comme souhaité).
 
 --- Statistiques descriptives ---
-```{r Stats descriptives : tendances générales}
+```{r stats_descriptives}
 quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
 bsp_col <- names(data)[grepl("Balance.*sheet.*position|Balance.*position", names(data), ignore.case = TRUE)][1]
 
@@ -236,11 +246,11 @@ long_filtered <- data_reduced %>%
   mutate(amount = as.numeric(amount))
 
 # verification (ie 'total claims', 'total liabilities')
-bsp_values <- unique(na.omit(long[[bsp_col]]))
+bsp_values <- unique(na.omit(data[[bsp_col]]))
 cat("Found BSP column:", bsp_col, "\nValues:", paste(head(bsp_values, 10), collapse = ", "), "\n")
 
 # stat descr par periode et BSP value
-stats_tbl <- long %>%
+stats_tbl <- long_filtered %>%
   filter(!is.na(amount)) %>%
   mutate(bsp = .data[[bsp_col]],
          amount_bn = amount / 1000) %>% # conversion en Md ici
@@ -716,7 +726,7 @@ print(as.data.frame(summary_table))
 ```
 
 --- Stats descrp : monnaie d'échange ---
-```{r Monnaie d'échange}
+```{r monnaie_echange}
 # meme logique secteur de contrepartie avec filtre à partir de 2014
 quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
 bsp_col <- names(data)[grepl("Balance.*sheet.*position|Balance.*position", names(data), ignore.case = TRUE)][1]

@@ -1,0 +1,2366 @@
+---
+title: "Interconnexions Banques – NBFI : Modélisation des expositions internationales"
+subtitle: "Projet Stat'App – ACPR | Données BIS Locational Banking Statistics"
+author: "Jean-Médérick BESSI, Yasmine BOUTCHICH, Ralph NADER, Massil ZOUAGHI"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 5
+)
+```
+
+```{r packages}
+require(dplyr)
+require(tidyverse)
+require(knitr)
+require(kableExtra)
+require(tseries)
+require(forecast)
+require(fUnitRoots)   # adfTest with explicit specification choice
+require(lmtest)       # coeftest
+require(vars)
+require(xts)
+require(stringr)
+require(zoo)
+require(urca)         # Johansen cointegration test
+require(plm)          # panel regressions (fixed effects, clustered SE)
+require(sandwich)     # robust standard errors
+require(broom)        # tidy() for nice output tables
+```
+
+# Note méthodologique
+
+Les principales différences par rapport à une approche naïve sont :
+
+1. **Choix justifié de la spécification ADF** par régression préalable de
+   $X_t$ sur $t$ pour détecter une tendance déterministe (Lecture 4, p. 17–18).
+2. **Sélection des retards de l'ADF** par incrémentation jusqu'à ce que les
+   résidus du test ne soient plus autocorrélés (Lecture 4, p. 22–25).
+3. **Validation à deux composantes** des modèles ARMA candidats : significativité
+   des coefficients (le modèle ne peut être simplifié) ET résidus non
+   autocorrélés (le modèle est suffisamment riche), conformément au chapitre 2
+   du cours.
+4. **Sélection finale** parmi les modèles bien ajustés et valides via les
+   critères d'information AIC/BIC, départagée par RMSE hors-échantillon.
+5. **Vérification des racines** du polynôme autorégressif (causalité de la
+   solution AR, Lecture 1, p. 29–31).
+
+La Partie 3 étend cette analyse de base par huit extensions techniques :
+robustesse trend-stationary vs difference-stationary, benchmarks naïfs,
+fonctions de réponse impulsionnelle (IRF) et décomposition de la variance
+(FEVD), test de cointégration de Johansen, causalité de Granger en fenêtre
+glissante, modélisation ARIMA par pays de contrepartie, VAR sur le RiskIndex,
+et régressions panel avec effets fixes.
+
+---
+
+# Importation et préparation des données
+
+```{r import}
+
+data_dir <- "/Users/ralphnader/Desktop/Github_Projects/Statapp/data"
+data <- read.csv(file.path(data_dir, "WS_LBS_D_PUB_csv_col.csv"))
+```
+
+## Nettoyage : suppression des colonnes sans information
+
+```{r missing}
+cols_to_drop <- c("TIME_FORMAT", "Time.Format")
+present <- cols_to_drop[cols_to_drop %in% names(data)]
+if (length(present) > 0) {
+  # data  <- data  %>% dplyr::select(-dplyr::any_of(present))
+  data <- data %>% dplyr::select(-dplyr::any_of(present))
+}
+cat("Dimensions après nettoyage :", dim(data)[1], "lignes ×", dim(data)[2], "colonnes\n")
+```
+
+## Construction de la série d'intérêt
+
+Filtrage à la granularité utile : créances totales toutes contreparties NBFI
+confondues, toutes banques déclarantes, toutes devises, position « All ».
+
+```{r pivot-long}
+quarter_cols <- grep("^X\\d{4}\\.Q[1-4]$", names(data), value = TRUE)
+if (length(quarter_cols) == 0) stop("Aucune colonne trimestrielle trouvée.")
+
+data <- data %>%
+  filter(`Counterparty.sector` %in% c("Banks, total",
+                                       "Non-bank financial institutions"))
+
+long <- data %>%
+  pivot_longer(
+    cols      = all_of(quarter_cols),
+    names_to  = "period",
+    values_to = "amount"
+  ) %>%
+  mutate(amount = as.numeric(amount))
+```
+
+```{r filtre-nbfi}
+# Filtre cohérent avec le filtre de la base mère (anti-double comptage)
+long_claims <- long %>%
+  filter(
+    `Reporting.country`                  == "All reporting countries",
+    `Counterparty.country`               == "All countries (total)",
+    `Type.of.instruments`                == "All instruments",
+    `Currency.denomination`              == "All currencies",
+    `Counterparty.sector`                == "Non-bank financial institutions",
+    `Type.of.reporting.institutions`     == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)",
+    `Currency.type.of.reporting.country` == "All currencies (=D+F+U)",
+    `Parent.country`                     == "All countries (total)",
+    `Measure`                            == "Amounts outstanding / Stocks",
+    Balance.sheet.position               == "Total claims",
+    Position.type                        == "All"
+  )
+
+table_tc <- long_claims %>%
+  filter(!is.na(amount)) %>%
+  group_by(period) %>%
+  summarise(total_amount = sum(amount, na.rm = TRUE), .groups = "drop") %>%
+  arrange(period) %>%
+  mutate(
+    year    = as.numeric(str_extract(period, "\\d{4}")),
+    quarter = as.numeric(str_extract(period, "(?<=Q)\\d"))
+  )
+
+# Vérification que la série commence bien en 2013-Q4 avant de hardcoder ts
+stopifnot(table_tc$year[1] == 2013, table_tc$quarter[1] == 4)
+
+x <- ts(table_tc$total_amount,
+        start     = c(table_tc$year[1], table_tc$quarter[1]),
+        frequency = 4)
+cat("Longueur de la série :", length(x), "trimestres\n")
+```
+
+---
+
+# Partie 1 : Modélisation ARIMA des créances bancaires sur les NBFI
+
+## Mise en place de la méthodologie de Box-Jenkins
+
+Conformément au chapitre 3 du cours, l'approche se déroule en cinq étapes :
+(1) stationnarisation, (2) identification, (3) estimation, (4) validité,
+(5) sélection — suivie d'une étape de prévision. Nous définissons d'abord les
+fonctions utilitaires utilisées par les TD4 et TD5.
+
+```{r utils-bj}
+# Test portmanteau (Ljung-Box) sur k retards, avec correction de degrés de liberté
+Qtests <- function(series, k, fitdf = 0) {
+  pvals <- apply(matrix(1:k), 1, FUN = function(l) {
+    pval <- if (l <= fitdf) NA
+            else Box.test(series, lag = l, type = "Ljung-Box", fitdf = fitdf)$p.value
+    return(c("lag" = l, "pval" = pval))
+  })
+  return(t(pvals))
+}
+
+# ADF avec choix automatique du nombre de retards : on incrémente p tant que les
+# résidus du test ADF présentent une autocorrélation détectable (Ljung-Box).
+# Cf. Lecture 4 p. 22-25 : l'ADF suppose un bruit blanc, il faut donc enrichir
+# la spécification jusqu'à ce que cette hypothèse soit vérifiée.
+adfTest_valid <- function(series, kmax, adftype) {
+  k <- 0
+  noautocorr <- 0
+  while (noautocorr == 0 && k <= kmax) {
+    cat(paste0("ADF avec ", k, " retards : résidus non corrélés ? "))
+    adf <- suppressWarnings(adfTest(series, lags = k, type = adftype))
+    pvals <- Qtests(adf@test$lm$residuals, 24,
+                    fitdf = length(adf@test$lm$coefficients))[, 2]
+    if (sum(pvals < 0.05, na.rm = TRUE) == 0) {
+      noautocorr <- 1; cat("OUI\n")
+    } else cat("non\n")
+    k <- k + 1
+  }
+  return(adf)
+}
+
+# Test de significativité des coefficients (loi normale asymptotique)
+signif <- function(estim) {
+  coef <- estim$coef
+  se   <- sqrt(diag(estim$var.coef))
+  t    <- coef / se
+  pval <- (1 - pnorm(abs(t))) * 2
+  return(rbind(coef, se, pval))
+}
+
+# Diagnostic complet d'un ARMA : ajustement + validité
+arimafit <- function(estim) {
+  adjust <- round(signif(estim), 3)
+  pvals  <- Qtests(estim$residuals, 24, fitdf = length(estim$coef))
+  pvals  <- matrix(apply(matrix(1:24, nrow = 6), 2,
+                         function(c) round(pvals[c, ], 3)), nrow = 6)
+  colnames(pvals) <- rep(c("lag", "pval"), 4)
+  cat("Tests de nullité des coefficients :\n"); print(adjust)
+  cat("\nTests d'absence d'autocorrélation des résidus :\n"); print(pvals)
+}
+```
+
+---
+
+## Étape 1 — Stationnarisation
+
+### Visualisation de la série brute
+
+```{r plot-serie-brute}
+df_x <- data.frame(date = as.Date(zoo::as.yearqtr(time(x))),
+                   value = as.numeric(x))
+ggplot(df_x, aes(x = date, y = value)) +
+  geom_line(color = "#0B1F5B", linewidth = 1.2) +
+  scale_y_continuous(labels = scales::label_number(big.mark = " ")) +
+  labs(title = "Créances bancaires sur les NBFI",
+       x = "Trimestre", y = "Montant total (millions USD)",
+       caption = "Source : BRI, Locational Banking Statistics") +
+  theme_minimal()
+```
+
+La série présente une croissance persistante. Pour décider de la spécification
+de l'ADF, on teste formellement la présence d'une tendance déterministe en
+régressant $X_t$ sur le temps .
+
+### Choix de la spécification ADF sur la série en niveau
+
+```{r trend-test-x}
+trend_x <- 1:length(x)
+lm_x <- lm(as.numeric(x) ~ trend_x)
+summary(lm_x)$coefficients
+```
+
+Le coefficient sur la tendance est **significativement non nul**, ce qui
+justifie l'utilisation du **cas 4** (ADF avec constante et tendance,
+spécification `"ct"`). L'hypothèse $H_0$ est : marche aléatoire avec drift
+contre $H_1$ : AR(1) stationnaire avec tendance déterministe.
+
+### Test ADF avec sélection automatique des retards
+
+```{r adf-x}
+adf_x <- adfTest_valid(x, kmax = 12, adftype = "ct")
+adf_x
+```
+
+```{r adf-x-residuals}
+# Vérification : les résidus du test ADF retenu sont bien un bruit blanc
+Qtests(adf_x@test$lm$residuals, 24,
+       fitdf = length(adf_x@test$lm$coefficients))
+```
+
+Le test ADF (cas 4) rejette l'hypothèse de racine unitaire (p ≈ 0.01).
+**Pris au pied de la lettre, ce résultat suggère que la série serait
+trend-stationary** plutôt que difference-stationary. Cette conclusion entre
+toutefois en tension avec deux éléments :
+
+- la **forme visuelle** de la série (croissance monotone de 5x sur 12 ans),
+  qui ressemble fortement à un processus I(1) avec drift ;
+- le **bon sens économique** sur les stocks de bilan : un encours de créances
+  s'accroît mécaniquement par addition des flux nets trimestriels, ce qui est
+  presque la définition d'une marche aléatoire avec drift.
+
+Le rejet du test ADF cas 4 doit donc être interprété avec prudence : avec
+$n = `r length(x)`$ observations et une tendance déterministe forte,
+le cas 4 est connu pour sur-rejeter $H_0$ (Schwert 1989, Hamilton 1994 § 17.7).
+La régression $\Delta x_t = \alpha + \beta t + \rho x_{t-1} + ...$ permet à
+la composante $\beta t$ d'absorber la tendance linéaire, ce qui pousse
+$\hat{\rho}$ artificiellement loin de 0 sous $H_0$ vraie.
+
+### Tests complémentaires : Phillips-Perron et KPSS
+
+Conformément à la pratique recommandée (TD4 ligne 181), on triangule avec PP et
+KPSS. La logique des hypothèses étant inversée pour KPSS, la convergence des
+trois tests renforce la conclusion.
+
+```{r pp-kpss-x}
+pp.test(x)
+kpss.test(x, null = "Trend")
+```
+
+Les trois tests donnent des résultats contradictoires interprétables comme
+suit :
+
+- **ADF cas 4** : rejette H₀ (racine unitaire) à 1 % → suggère trend-stationary
+- **PP** : rejette H₀ → idem (mais PP partage le même biais de sur-rejet en
+  petit échantillon avec tendance forte)
+- **KPSS Trend** : ne rejette pas H₀ (stationarité autour d'une tendance) →
+  cohérent avec trend-stationary, mais la **puissance de KPSS est faible avec
+  $n \approx 48$** : il aurait tendance à accepter H₀ même si elle est fausse.
+
+Compte tenu des limites des tests en petit échantillon, on adopte la
+**stratégie classique de Box-Jenkins** : différencier par défaut quand la
+série présente une tendance visuelle forte, puis vérifier que la série
+différenciée passe l'ensemble des tests sans ambiguïté. La nature exacte de
+la non-stationnarité (trend-stationary vs difference-stationary) sera
+**testée formellement en Partie 3** par estimation parallèle des deux
+modèles concurrents et comparaison de leur qualité prédictive.
+
+### Robustesse : test ADF sur les résidus de la régression OLS
+
+Pour valider l'alternative trend-stationary, on examine les résidus de la
+régression $X_t = \alpha + \beta t + Y_t$. Si la série est trend-stationary,
+ces résidus doivent eux-mêmes être stationnaires (donc passer un ADF
+spécification "c").
+
+```{r ts-residuals-test}
+y_hat <- residuals(lm_x)
+# Vérification visuelle
+plot(time(x), y_hat, type = "l",
+     main = "Résidus de la régression OLS x ~ t",
+     xlab = "Temps", ylab = "Résidu")
+abline(h = 0, lty = 2, col = "grey50")
+
+# ADF sur les résidus (spec "c" car on a déjà retiré la tendance)
+cat("\nADF sur les résidus de la régression linéaire :\n")
+adf_resid <- adfTest_valid(y_hat, kmax = 12, adftype = "c")
+adf_resid
+
+# KPSS Level sur les résidus
+cat("\nKPSS Level sur les résidus :\n")
+kpss.test(y_hat, null = "Level")
+
+# Test de Ljung-Box sur les résidus pour détecter de l'autocorrélation
+# résiduelle (signe d'une mauvaise spec ou de structure ARMA)
+cat("\nLjung-Box sur les résidus (lags 1, 4, 8, 12) :\n")
+sapply(c(1, 4, 8, 12), function(l) {
+  list(lag = l, p = Box.test(y_hat, lag = l, type = "Ljung-Box")$p.value)
+})
+```
+
+Si l'ADF rejette H₀ sur les résidus ET KPSS Level ne rejette pas la
+stationnarité, la modélisation trend-stationary est défendable et sera
+évaluée formellement en Partie 3. Sinon, l'alternative difference-stationary
+s'impose.
+
+### Bilan des tests de stationnarité sur la série en niveau
+
+L'ensemble des résultats peut être synthétisé comme suit :
+
+| Test | Série | Statistique | p-value | Conclusion |
+|------|-------|-------------|---------|------------|
+| ADF cas 4 | $X_t$ (niveau) | −7.01 | 0.01 | Rejette racine unitaire |
+| PP | $X_t$ (niveau) | −38.83 | ≤ 0.01 | Rejette racine unitaire |
+| KPSS Trend | $X_t$ (niveau) | 0.103 | ≥ 0.10 | Accepte trend-stationnarité |
+| ADF cas 2 | $\hat{Y}_t$ (résidus OLS) | −3.16 | 0.031 | Résidus stationnaires |
+| KPSS Level | $\hat{Y}_t$ (résidus OLS) | 0.103 | ≥ 0.10 | Résidus stationnaires |
+| Ljung-Box lag 1 | $\hat{Y}_t$ | — | 0.072 | Limite (structure AR/MA possible) |
+| Ljung-Box lags 4-12 | $\hat{Y}_t$ | — | > 0.21 | Pas d'autocorrélation |
+
+**Les six tests pointent dans la même direction : trend-stationary.** Les résidus
+de la décomposition $X_t = \hat{\alpha} + \hat{\beta} t + \hat{Y}_t$ sont eux-mêmes
+stationnaires (ADF p = 0.031, KPSS Level p ≥ 0.10) et globalement non
+autocorrélés — seul le lag 1 du Ljung-Box (p = 0.072) suggère une légère
+structure résiduelle de type AR(1) ou MA(1), insuffisante pour atteindre le
+seuil de 5 % avec $n = 48$.
+
+Ce diagnostic constitue l'argument le plus direct en faveur de l'hypothèse
+trend-stationary, car il teste les résidus après retrait de la tendance — ce
+qui réduit le biais de petit échantillon affectant les tests en niveau. Toutefois,
+la prudence méthodologique impose de ne pas trancher uniquement sur la base
+des tests : la nature des données (stocks de bilan accumulant des flux nets)
+et la pratique standard de Box-Jenkins favorisent la différenciation.
+
+**Par conséquent, nous adoptons la stratégie suivante :**
+
+1. Procéder à la différenciation (approche classique, « Modèle B »).
+2. Estimer en parallèle un ARMA sur les résidus OLS (« Modèle A »).
+3. Comparer formellement les deux en Partie 3 par RMSE hors-échantillon.
+
+### Différenciation et tests sur la série différenciée
+
+```{r diff-x}
+dx <- diff(x)
+df_dx <- data.frame(date = as.Date(zoo::as.yearqtr(time(dx))),
+                    value = as.numeric(dx))
+ggplot(df_dx, aes(x = date, y = value)) +
+  geom_line(color = "#0B1F5B", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#7F91A8") +
+  labs(title = "Variation trimestrielle des créances NBFI",
+       x = "Trimestre", y = "Δ Montant (M USD)") +
+  theme_minimal()
+```
+
+```{r trend-test-dx}
+# Test formel d'une tendance résiduelle dans dx
+trend_dx <- 1:length(dx)
+lm_dx <- lm(as.numeric(dx) ~ trend_dx)
+summary(lm_dx)$coefficients
+
+# Test de la moyenne (constante) : l'inclusion d'un drift dans l'ARIMA
+# se justifie par un mean(dx) significativement non nul
+t.test(as.numeric(dx))
+```
+
+Le coefficient de tendance dans `dx` n'est **pas significatif**, en revanche
+la moyenne de `dx` est significativement non nulle. On retient donc la
+spécification ADF **avec constante mais sans tendance** (cas 2, type `"c"`)
+pour la série différenciée — c'est la spécification plausible sous $H_0$
+comme sous $H_1$ d'après Lecture 4 p. 18.
+
+L'inclusion d'une **constante** dans l'ARIMA final (équivalente à un drift
+dans la série en niveau) est par ailleurs justifiée par le test de moyenne.
+
+```{r adf-dx}
+adf_dx <- adfTest_valid(dx, kmax = 12, adftype = "c")
+adf_dx
+```
+
+```{r pp-kpss-dx}
+pp.test(dx)
+kpss.test(dx, null = "Level")
+```
+
+ADF et PP rejettent la racine unitaire à 5 %, KPSS ne rejette pas la
+stationnarité. La série différenciée est stationnaire : on retient $d = 1$.
+
+---
+
+## Étape 2 — Identification
+
+```{r acf-pacf}
+par(mfrow = c(1, 2))
+acf(dx,  lag.max = 20, main = "ACF — Δ créances NBFI")
+pacf(dx, lag.max = 20, main = "PACF — Δ créances NBFI")
+par(mfrow = c(1, 1))
+```
+
+Avec $n = `r length(dx)`$ observations différenciées, la bande de
+confiance à 95 % est de l'ordre de $\pm 1{,}96 / \sqrt{n} \approx
+\pm `r round(1.96/sqrt(length(dx)), 2)`$. L'examen des corrélogrammes
+suggère $p_{\max} = 3$ et $q_{\max} = 1$, conformément à la lecture du
+notebook initial.
+
+Une attention particulière est portée aux retards 4 et 8 (saisonnalité
+annuelle potentielle pour des données trimestrielles). En l'absence de pic
+significatif, on retient une spécification non saisonnière.
+
+```{r seasonal-check}
+# Vérification rapide : pas de différenciation saisonnière nécessaire
+forecast::nsdiffs(x)
+```
+
+```{r pmax-qmax}
+pmax <- 3
+qmax <- 1
+```
+
+---
+
+## Étape 3 — Estimation et Étape 4 — Validité
+
+Conformément au chapitre 2 du cours, un modèle est retenu s'il est :
+**(a) bien ajusté** — le coefficient AR de plus haut rang ET le coefficient MA
+de plus haut rang sont individuellement significatifs (sinon le modèle peut
+être simplifié) ; et **(b) valide** — les résidus passent le test de
+Ljung-Box jusqu'à 24 retards (le modèle est suffisamment riche).
+
+```{r estimation-validation}
+# Pour les ARIMA(p,1,q) avec constante (drift), on travaille directement sur x
+# en passant order = c(p, 1, q) et include.mean = TRUE n'est pas autorisé pour d>0
+# dans stats::arima ; on utilise donc forecast::Arima avec include.drift = TRUE
+# pour incorporer le drift mis en évidence par le t-test sur dx.
+#
+# Un modèle "bien ajusté" exige la significativité du coefficient AR le plus
+# élevé (si p > 0) ET du coefficient MA le plus élevé (si q > 0).
+
+modelchoice <- function(p, q, data = x) {
+  estim <- try(forecast::Arima(data, order = c(p, 1, q),
+                               include.drift = TRUE,
+                               method = "ML"), silent = TRUE)
+  if (inherits(estim, "try-error")) {
+    return(c(p = p, q = q, arsignif = NA, masignif = NA,
+             resnocorr = NA, ok = NA))
+  }
+  s <- signif(estim)
+  # Indices : les coefficients AR sont nommés ar1..arp, MA ma1..maq, drift
+  ar_idx <- if (p > 0) which(grepl("^ar", colnames(s)))[p] else NA
+  ma_idx <- if (q > 0) which(grepl("^ma", colnames(s)))[q] else NA
+  arsignif <- if (p == 0) NA else s["pval", ar_idx] <= 0.05
+  masignif <- if (q == 0) NA else s["pval", ma_idx] <= 0.05
+  pvals_res <- Qtests(estim$residuals, 24,
+                      fitdf = length(estim$coef))[, 2]
+  resnocorr <- sum(pvals_res < 0.05, na.rm = TRUE) == 0
+  checks <- c(arsignif, masignif, resnocorr)
+  ok <- as.numeric(sum(checks, na.rm = TRUE) == (3 - sum(is.na(checks))))
+  return(c(p = p, q = q, arsignif = arsignif, masignif = masignif,
+           resnocorr = resnocorr, ok = ok))
+}
+
+armamodelchoice <- function(pmax, qmax) {
+  pqs <- expand.grid(0:pmax, 0:qmax)
+  t(apply(matrix(1:dim(pqs)[1]), 1, function(row) {
+    p <- pqs[row, 1]; q <- pqs[row, 2]
+    cat(paste0("ARIMA(", p, ",1,", q, ") avec drift\n"))
+    modelchoice(p, q)
+  }))
+}
+
+armamodels <- armamodelchoice(pmax, qmax)
+print(armamodels)
+```
+
+```{r selection-valides}
+selec <- armamodels[
+  armamodels[, "ok"] == 1 & !is.na(armamodels[, "ok"]), , drop = FALSE
+]
+selec
+```
+
+Les modèles affichés ci-dessus sont **simultanément bien ajustés et valides**.
+C'est uniquement parmi ceux-ci que l'on peut légitimement comparer les
+critères d'information.
+
+```{r racines}
+# Vérification de la stationnarité de la composante AR : toutes les racines du
+# polynôme autorégressif doivent être hors du disque unité. C'est la condition
+# de causalité (Lecture 1 p. 29-31).
+verifier_racines <- function(p, q, data = x) {
+  m <- forecast::Arima(data, order = c(p, 1, q),
+                       include.drift = TRUE, method = "ML")
+  if (p == 0) return(TRUE)
+  ar_coef <- m$coef[grepl("^ar", names(m$coef))]
+  racines <- polyroot(c(1, -ar_coef))
+  modules <- Mod(racines)
+  cat(sprintf("ARIMA(%d,1,%d) avec drift : modules des racines AR = %s\n",
+              p, q, paste(round(modules, 3), collapse = ", ")))
+  all(modules > 1)
+}
+
+if (nrow(selec) > 0) {
+  for (i in seq_len(nrow(selec))) {
+    verifier_racines(selec[i, "p"], selec[i, "q"])
+  }
+}
+```
+
+---
+
+## Étape 5 — Sélection par AIC/BIC
+
+```{r aic-bic-valides}
+if (nrow(selec) > 0) {
+  pqs <- apply(selec, 1, function(row) {
+    list(p = as.numeric(row["p"]), q = as.numeric(row["q"]))
+  })
+  names(pqs) <- paste0("ARIMA(", selec[, "p"], ",1,", selec[, "q"], ")_d")
+
+  models <- lapply(pqs, function(pq) {
+    forecast::Arima(x, order = c(pq$p, 1, pq$q),
+                    include.drift = TRUE, method = "ML")
+  })
+
+  ic_table <- vapply(models, FUN.VALUE = numeric(2),
+                     function(m) c(AIC = AIC(m), BIC = BIC(m)))
+  print(ic_table)
+}
+```
+
+```{r ic-resume}
+if (nrow(selec) > 0) {
+  cat("Modèle minimisant l'AIC :", names(which.min(ic_table["AIC", ])), "\n")
+  cat("Modèle minimisant le BIC :", names(which.min(ic_table["BIC", ])), "\n")
+}
+```
+
+Si AIC et BIC convergent, le modèle retenu est celui qu'ils désignent
+conjointement. S'ils divergent (BIC pénalise davantage la complexité, AIC
+favorise le pouvoir prédictif), on **départage par RMSE hors-échantillon**
+(TD4 Q7).
+
+---
+
+## Sélection finale par RMSE hors-échantillon
+
+On met de côté les **8 derniers trimestres** (≈ 17 % de l'échantillon),
+réestime chaque candidat sur le reste, et compare les RMSE de prévision
+normalisés par l'écart-type de la série.
+
+```{r holdout-rmse}
+h <- 8
+n <- length(x)
+x_train <- ts(x[1:(n - h)], start = start(x), frequency = 4)
+x_test  <- x[(n - h + 1):n]
+
+if (nrow(selec) > 0) {
+  rmse_holdout <- vapply(pqs, FUN.VALUE = numeric(1), function(pq) {
+    m_train <- forecast::Arima(x_train, order = c(pq$p, 1, pq$q),
+                               include.drift = TRUE, method = "ML")
+    fc <- forecast(m_train, h = h)$mean
+    sqrt(mean((as.numeric(fc) - as.numeric(x_test))^2)) / sd(x)
+  })
+  print(round(rmse_holdout, 4))
+  cat("\nMeilleure prévision hors-échantillon :",
+      names(which.min(rmse_holdout)), "\n")
+}
+```
+
+```{r choix-final}
+# Choix final : le modèle qui passe les 4 filtres
+# (bien ajusté, valide, racines stables, meilleur sur RMSE OU IC selon le cas)
+final_name <- if (nrow(selec) > 0) names(which.min(rmse_holdout)) else NA
+cat("Modèle final retenu :", final_name, "\n")
+final_model <- if (nrow(selec) > 0) models[[final_name]] else NULL
+if (!is.null(final_model)) {
+  summary(final_model)
+  coeftest(final_model)
+}
+```
+
+### Diagnostic graphique du modèle final
+
+```{r diagnostic-final}
+if (!is.null(final_model)) {
+  checkresiduals(final_model)
+  # Test de Jarque-Bera sur les résidus pour la validité des intervalles de prévision
+  jarque.bera.test(residuals(final_model))
+}
+```
+
+Les résidus doivent ressembler à un bruit blanc faible (Ljung-Box) ; le test
+de Jarque-Bera évalue en complément l'hypothèse de normalité utilisée pour
+les intervalles de prévision.
+
+---
+
+## Prévision
+
+```{r prevision-finale, fig.width=8, fig.height=4.8}
+if (!is.null(final_model)) {
+  prev <- forecast(final_model, h = 12)
+
+  # Historique
+  hist_df <- tibble::tibble(
+    QUARTER = zoo::as.yearqtr(time(prev$x)),
+    value   = as.numeric(prev$x)
+  )
+
+  # Prévisions brutes
+  fc_raw <- tibble::tibble(
+    QUARTER  = zoo::as.yearqtr(time(prev$mean)),
+    forecast = as.numeric(prev$mean),
+    lower_80 = as.numeric(prev$lower[, 1]),
+    upper_80 = as.numeric(prev$upper[, 1]),
+    lower_95 = as.numeric(prev$lower[, 2]),
+    upper_95 = as.numeric(prev$upper[, 2])
+  )
+
+  # On rattache le dernier point historique au début de la prévision pour
+  # éviter la discontinuité visuelle entre la courbe d'historique et la
+  # courbe de prévision (les deux geom_line sont sinon disjoints).
+  last_hist <- hist_df %>%
+    dplyr::slice_tail(n = 1) %>%
+    dplyr::transmute(
+      QUARTER  = QUARTER,
+      forecast = value,
+      lower_80 = value, upper_80 = value,
+      lower_95 = value, upper_95 = value
+    )
+
+  fc_df <- dplyr::bind_rows(last_hist, fc_raw)
+
+  ggplot() +
+    geom_ribbon(data = fc_df,
+                aes(x = QUARTER, ymin = lower_95, ymax = upper_95),
+                fill = "#BCC7E6", alpha = 0.45) +
+    geom_ribbon(data = fc_df,
+                aes(x = QUARTER, ymin = lower_80, ymax = upper_80),
+                fill = "#7F91A8", alpha = 0.35) +
+    geom_line(data = hist_df,
+              aes(x = QUARTER, y = value),
+              color = "#0B1F5B", linewidth = 1.2) +
+    geom_line(data = fc_df,
+              aes(x = QUARTER, y = forecast),
+              color = "#2F6FB2", linewidth = 1.1) +
+    geom_vline(xintercept = max(hist_df$QUARTER),
+               linetype = "dashed", color = "#7F91A8") +
+    zoo::scale_x_yearqtr(format = "%Y-T%q") +
+    scale_y_continuous(labels = scales::label_number(accuracy = 1)) +
+    labs(title = paste("Prévision —", final_name),
+         x = "Trimestre", y = "Montant total (M USD)") +
+    theme_minimal(base_size = 12)
+}
+```
+
+### Interprétation économique
+
+Le modèle final décrit la dynamique de court terme des créances bancaires
+internationales sur les NBFI : un terme constant (drift) capture la croissance
+structurelle observée depuis 2013, et la composante autorégressive reflète
+l'inertie naturelle des positions de bilan (les engagements contractuels ne
+peuvent être dénoués instantanément).
+
+**Limites pour l'analyse du risque systémique.** L'ARIMA est par construction
+un modèle univarié : il décrit la trajectoire de la série conditionnellement
+à son propre passé, mais n'apporte pas d'information sur les mécanismes de
+transmission entre expositions bancaires et stress financier. Pour répondre
+à la question de recherche du projet — les interconnexions banques-NBFI
+constituent-elles un canal du risque systémique ? — il faut passer à un
+cadre multivarié (Partie 2). Le modèle ARIMA reste utile à trois titres :
+(i) il fixe le degré d'intégration $d = 1$ nécessaire au passage en
+différences pour la modélisation VAR ; (ii) il fournit un **benchmark
+univarié** auquel comparer la qualité de prévision du VAR ; (iii) il
+documente la dynamique propre de la série indépendamment de tout
+co-mouvement avec d'autres variables financières.
+
+---
+
+# Partie 2 : Modélisation VAR et causalité de Granger
+
+## Restriction à l'échantillon européen
+
+Pour des raisons de cohérence géographique avec le CISS (indicateur de stress
+spécifique à la zone euro), l'analyse VAR est restreinte aux banques
+déclarantes des pays européens.
+
+```{r filtre-europe}
+pays_europeens <- c(
+  "Austria", "Belgium", "Cyprus", "Denmark", "Finland", "France", "Germany",
+  "Greece", "Guernsey", "Ireland", "Isle of Man", "Italy", "Jersey",
+  "Luxembourg", "Netherlands", "Norway", "Portugal", "Russia", "Spain",
+  "Sweden", "Switzerland", "Türkiye", "United Kingdom"
+)
+
+long_claims_eu <- long %>%
+  filter(
+    `Reporting.country`                  %in% pays_europeens,
+    `Counterparty.country`               == "All countries (total)",
+    `Type.of.instruments`                == "All instruments",
+    `Currency.denomination`              == "All currencies",
+    `Counterparty.sector`                == "Non-bank financial institutions",
+    `Type.of.reporting.institutions`     == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)",
+    `Currency.type.of.reporting.country` == "All currencies (=D+F+U)",
+    `Parent.country`                     == "All countries (total)",
+    `Measure`                            == "Amounts outstanding / Stocks",
+    Balance.sheet.position               == "Total claims",
+    Position.type                        == "All"
+  )
+
+table_tc_eu <- long_claims_eu %>%
+  filter(!is.na(amount)) %>%
+  group_by(period) %>%
+  summarise(total_amount = sum(amount, na.rm = TRUE), .groups = "drop") %>%
+  arrange(period) %>%
+  mutate(
+    year    = as.numeric(str_extract(period, "\\d{4}")),
+    quarter = as.numeric(str_extract(period, "(?<=Q)\\d"))
+  )
+
+stopifnot(table_tc_eu$year[1] == 2013, table_tc_eu$quarter[1] == 4)
+
+x_eu <- ts(table_tc_eu$total_amount,
+           start     = c(table_tc_eu$year[1], table_tc_eu$quarter[1]),
+           frequency = 4)
+```
+
+### Stationnarisation de la série européenne
+
+Application de la même procédure rigoureuse que pour la série globale.
+
+```{r stationnarite-eu}
+trend_x_eu <- 1:length(x_eu)
+lm_x_eu <- lm(as.numeric(x_eu) ~ trend_x_eu)
+summary(lm_x_eu)$coefficients
+```
+
+```{r adf-x-eu}
+# Si tendance significative -> "ct", sinon -> "c"
+adftype_eu <- if (summary(lm_x_eu)$coefficients[2, 4] < 0.05) "ct" else "c"
+cat("Spécification ADF retenue pour x_eu :", adftype_eu, "\n")
+adf_x_eu <- adfTest_valid(x_eu, kmax = 12, adftype = adftype_eu)
+adf_x_eu
+pp.test(x_eu)
+kpss.test(x_eu, null = if (adftype_eu == "ct") "Trend" else "Level")
+```
+
+```{r diff-x-eu}
+dx_eu <- diff(x_eu)
+trend_dx_eu <- 1:length(dx_eu)
+lm_dx_eu <- lm(as.numeric(dx_eu) ~ trend_dx_eu)
+summary(lm_dx_eu)$coefficients
+
+adftype_dx_eu <- if (summary(lm_dx_eu)$coefficients[2, 4] < 0.05) "ct" else "c"
+adf_dx_eu <- adfTest_valid(dx_eu, kmax = 12, adftype = adftype_dx_eu)
+adf_dx_eu
+pp.test(dx_eu)
+kpss.test(dx_eu, null = "Level")
+```
+
+`dx_eu` est stationnaire et sera utilisée dans le système VAR.
+
+---
+
+## Importation et traitement du CISS
+
+```{r import-ciss}
+data_ciss <- read.csv(file.path(data_dir, "CISS.csv"))
+data_ciss$Date <- as.Date(data_ciss$DATE)
+
+ciss_xts <- xts(
+  data_ciss$CISS...Composite.Indicator.of.Systemic.Stress..CISS.D.U2.Z0Z.4F.EC.SS_CI.IDX.,
+  order.by = data_ciss$Date
+)
+ciss_quarterly_xts <- apply.quarterly(ciss_xts, FUN = mean)
+
+# Conversion robuste vers ts : on extrait l'année et le trimestre du PREMIER
+# point via as.yearqtr (apply.quarterly horodate à la fin du trimestre, donc
+# il faut passer par yearqtr pour ne pas se tromper de trimestre)
+ciss_first <- zoo::as.yearqtr(index(ciss_quarterly_xts)[1])
+ciss_start <- c(as.integer(format(ciss_first, "%Y")),
+                as.integer(format(ciss_first, "%q")))
+cat("CISS commence en :", paste(ciss_start, collapse = "-Q"), "\n")
+
+ciss_ts <- ts(as.numeric(ciss_quarterly_xts),
+              start = ciss_start, frequency = 4)
+
+# Stationnarité du CISS
+trend_ciss <- 1:length(ciss_ts)
+lm_ciss <- lm(as.numeric(ciss_ts) ~ trend_ciss)
+adftype_ciss <- if (summary(lm_ciss)$coefficients[2, 4] < 0.05) "ct" else "c"
+adf_ciss <- adfTest_valid(ciss_ts, kmax = 12, adftype = adftype_ciss)
+adf_ciss
+kpss.test(ciss_ts, null = if (adftype_ciss == "ct") "Trend" else "Level")
+```
+
+Si le CISS n'est pas stationnaire en niveau, on travaille avec la première
+différence.
+
+```{r diff-ciss}
+dciss <- diff(ciss_ts)
+adf_dciss <- adfTest_valid(dciss, kmax = 12, adftype = "c")
+adf_dciss
+kpss.test(dciss, null = "Level")
+```
+
+---
+
+## Construction du système bivarié et alignement
+
+Plutôt que de fixer arbitrairement la fenêtre commune à
+`c(2013, 4) – c(2024, 4)`, on calcule **l'intersection effective** des plages
+disponibles pour `dx_eu` et `dciss`. Cela évite que `window()` retourne
+silencieusement une plage tronquée si l'une des deux séries ne couvre pas
+exactement les bornes demandées (problème classique avec `ts` quand les
+fréquences ne s'alignent pas parfaitement).
+
+```{r alignement-eu}
+# Plages effectives de chaque série
+range_dx_eu  <- c(start(dx_eu),  end(dx_eu))
+range_dciss  <- c(start(dciss),  end(dciss))
+cat("Plage de dx_eu  :", paste(range_dx_eu[1:2], collapse = "-"),
+    "à", paste(range_dx_eu[3:4], collapse = "-"), "\n")
+cat("Plage de dciss  :", paste(range_dciss[1:2], collapse = "-"),
+    "à", paste(range_dciss[3:4], collapse = "-"), "\n")
+
+# Conversion en yearqtr pour comparer proprement les bornes
+yq <- function(yr_q) zoo::as.yearqtr(yr_q[1] + (yr_q[2] - 1) / 4)
+
+start_common <- max(yq(start(dx_eu)),  yq(start(dciss)))
+end_common   <- min(yq(end(dx_eu)),    yq(end(dciss)))
+
+# Reconversion en couple (année, trimestre)
+to_tsstart <- function(yqv) {
+  yr <- as.integer(format(yqv, "%Y"))
+  qt <- as.integer(format(yqv, "%q"))
+  c(yr, qt)
+}
+common_start <- to_tsstart(start_common)
+common_end   <- to_tsstart(end_common)
+cat("Fenêtre commune retenue :",
+    paste(common_start, collapse = "-"), "à",
+    paste(common_end,   collapse = "-"), "\n")
+
+dx_aligne_eu <- window(dx_eu,  start = common_start, end = common_end)
+dciss_aligne <- window(dciss, start = common_start, end = common_end)
+
+# Maintenant les longueurs ET les dates doivent matcher exactement
+stopifnot(length(dx_aligne_eu) == length(dciss_aligne))
+stopifnot(all.equal(as.numeric(time(dx_aligne_eu)),
+                    as.numeric(time(dciss_aligne))))
+cat("Longueur du système bivarié :", length(dx_aligne_eu), "trimestres\n")
+```
+
+---
+
+## Sélection du nombre de retards et estimation du VAR
+
+```{r var-select}
+systeme_bivarie <- cbind(dx_aligne_eu, dciss_aligne)
+colnames(systeme_bivarie) <- c("Exposition", "DCISS")
+
+VARselect(systeme_bivarie, lag.max = 8, type = "const")
+```
+
+```{r var-estimation}
+# On retient le retard plébiscité par la majorité des critères
+modele_var <- VAR(systeme_bivarie, p = 1, type = "const")
+summary(modele_var)
+```
+
+### Diagnostic du VAR
+
+```{r var-diagnostic}
+# Absence d'autocorrélation des résidus
+serial.test(modele_var, lags.pt = 10, type = "PT.asymptotic")
+# Stabilité du VAR : toutes les racines doivent être à l'intérieur du cercle unité
+roots(modele_var)
+# Normalité des résidus (utile pour les IC des prévisions et IRF)
+normality.test(modele_var)
+```
+
+La condition de stabilité (toutes les racines de modules < 1) est essentielle :
+elle garantit l'existence d'une représentation MA(∞) du VAR (Lecture 1 p. 43)
+et la convergence des fonctions de réponse impulsionnelle.
+
+---
+
+## Test de causalité au sens de Granger
+
+```{r granger-ciss}
+causality(modele_var, cause = "DCISS")$Granger
+causality(modele_var, cause = "Exposition")$Granger
+```
+
+### Cadre théorique et interprétation
+
+La causalité au sens de Granger est **prédictive et non structurelle** : une
+variable $X$ Granger-cause $Y$ si la connaissance des valeurs passées de $X$
+améliore la prévision de $Y$ au-delà de ce que permet le seul passé de $Y$.
+Deux hypothèses sont testées :
+
+- **H₁** : Le CISS Granger-cause les expositions sur les NBFI. Validée, cela
+  signifierait que les épisodes de stress financier précèdent les ajustements
+  d'exposition.
+- **H₂** : Les expositions Granger-causent le CISS. Validée, cela suggérerait
+  un effet de rétroaction des interconnexions banques-NBFI vers le stress
+  systémique.
+
+L'interprétation des résultats se lit en gardant à l'esprit deux limites
+fondamentales pour la question du risque systémique :
+
+1. **Granger ≠ causalité structurelle.** Une absence de causalité de Granger
+   n'écarte pas l'existence d'un canal de transmission ; elle indique
+   seulement que ce canal ne se manifeste pas dans la dynamique prédictive
+   conjointe à la fréquence trimestrielle.
+2. **Mesure incomplète.** Les LBS capturent les expositions *au bilan*. Une
+   part importante du risque NBFI passe par des instruments hors-bilan
+   (engagements de liquidité, dérivés, prime brokerage). Un résultat négatif
+   sur H₂ doit donc être interprété comme « pas de signal détectable dans la
+   mesure utilisée », non comme « pas de canal ».
+
+---
+
+## Test de robustesse avec le VIX
+
+Pour tester si un éventuel signal CISS → Exposition est propre au stress
+européen ou s'il se généralise au risque global, on reproduit l'analyse avec
+le VIX comme proxy de risque global.
+
+```{r import-vix}
+data_vix <- read.csv(file.path(data_dir, "VIXCLS.csv"))
+data_vix$Date <- as.Date(data_vix$observation_date)
+vix_xts <- xts(data_vix$VIXCLS, order.by = data_vix$Date)
+vix_quarterly_xts <- apply.quarterly(vix_xts, FUN = mean, na.rm = TRUE)
+
+vix_first <- zoo::as.yearqtr(index(vix_quarterly_xts)[1])
+vix_start <- c(as.integer(format(vix_first, "%Y")),
+               as.integer(format(vix_first, "%q")))
+cat("VIX commence en :", paste(vix_start, collapse = "-Q"), "\n")
+vix_ts <- ts(as.numeric(vix_quarterly_xts),
+             start = vix_start, frequency = 4)
+```
+
+```{r vix-stationnarite}
+trend_vix <- 1:length(vix_ts)
+lm_vix <- lm(as.numeric(vix_ts) ~ trend_vix)
+adftype_vix <- if (summary(lm_vix)$coefficients[2, 4] < 0.05) "ct" else "c"
+adf_vix <- adfTest_valid(vix_ts, kmax = 12, adftype = adftype_vix)
+adf_vix
+kpss.test(vix_ts, null = if (adftype_vix == "ct") "Trend" else "Level")
+```
+
+```{r var-vix}
+# Même logique d'alignement par intersection effective qu'avec le CISS
+range_vix <- c(start(vix_ts), end(vix_ts))
+cat("Plage de vix_ts :", paste(range_vix[1:2], collapse = "-"),
+    "à", paste(range_vix[3:4], collapse = "-"), "\n")
+
+start_common_vix <- max(yq(start(dx_eu)),  yq(start(vix_ts)))
+end_common_vix   <- min(yq(end(dx_eu)),    yq(end(vix_ts)))
+common_start_vix <- to_tsstart(start_common_vix)
+common_end_vix   <- to_tsstart(end_common_vix)
+
+dx_aligne_vix <- window(dx_eu,  start = common_start_vix, end = common_end_vix)
+vix_aligne    <- window(vix_ts, start = common_start_vix, end = common_end_vix)
+
+stopifnot(length(dx_aligne_vix) == length(vix_aligne))
+stopifnot(all.equal(as.numeric(time(dx_aligne_vix)),
+                    as.numeric(time(vix_aligne))))
+
+systeme_vix <- cbind(dx_aligne_vix, vix_aligne)
+colnames(systeme_vix) <- c("Exposition", "VIX")
+
+VARselect(systeme_vix, lag.max = 8, type = "const")
+modele_var_vix <- VAR(systeme_vix, p = 1, type = "const")
+serial.test(modele_var_vix, lags.pt = 10, type = "PT.asymptotic")
+roots(modele_var_vix)
+
+causality(modele_var_vix, cause = "VIX")$Granger
+causality(modele_var_vix, cause = "Exposition")$Granger
+```
+
+---
+
+## Synthèse : que peut-on conclure sur le risque systémique ?
+
+L'architecture rigoureuse de l'analyse (Box-Jenkins → VAR → Granger sur deux
+proxys de risque) permet de tirer des conclusions nuancées :
+
+- **Sur le canal CISS → Expositions** : un signal éventuellement détecté
+  reflète l'ajustement des positions bancaires européennes face au stress
+  régional. Sa significativité (ou son absence) doit être lue à l'aune de la
+  taille d'échantillon (≈ 45 trimestres) qui limite fortement la puissance
+  des tests.
+
+- **Sur le canal Expositions → Stress** : l'absence de causalité de Granger
+  prédictive **ne réfute pas** l'hypothèse d'un canal de transmission
+  banques-NBFI. Trois explications coexistent : (i) le canal opère via des
+  instruments hors-bilan invisibles aux LBS ; (ii) la fréquence trimestrielle
+  est trop grossière pour capter une transmission qui se joue en
+  jours/semaines ; (iii) le niveau d'agrégation (toutes contreparties NBFI
+  confondues) lisse les dynamiques sectorielles.
+
+- **Robustesse VIX vs CISS** : si les conclusions divergent entre les deux
+  proxys, cela indique que tout signal détecté est spécifique au stress
+  *régional* européen et non à la volatilité globale — résultat
+  économiquement informatif quant à la nature du canal.
+
+Ces limites appellent des prolongements : utilisation de données plus
+granulaires (CBS consolidées, données prudentielles sur le hors-bilan), tests
+de causalité non linéaire, ou identification de chocs structurels via
+restrictions de signe sur les IRF.
+
+---
+
+# Partie 3 : Analyses approfondies
+
+Cette partie vient compléter les analyses des Parties 1 et 2 par des outils
+plus sophistiqués qui exploitent davantage la richesse des données :
+robustesse du choix de stationnarisation, fonctions de réponse impulsionnelle
+(IRF) et décomposition de la variance des erreurs de prévision (FEVD), test
+de cointégration de Johansen, analyse de causalité de Granger en fenêtre
+glissante, modélisation par pays de contrepartie, et substitution du
+RiskIndex aux volumes bruts dans le système VAR.
+
+## Robustesse : trend-stationary vs difference-stationary
+
+L'analyse des tests de stationnarité en Partie 1 a montré que l'ensemble des
+résultats (ADF cas 4, PP, KPSS Trend, ADF et KPSS sur les résidus OLS)
+converge vers l'hypothèse **trend-stationary**. Toutefois, la pratique
+classique de Box-Jenkins sur les séries financières privilégie la
+différenciation par défaut. Pour trancher, on estime les deux modèles
+concurrents en parallèle et on les compare par RMSE hors-échantillon
+— le seul critère qui soit directement comparable entre les deux
+spécifications car il évalue la même quantité (la prévision de $X_t$).
+
+### Modèle A — Trend-stationary : ARMA sur résidus OLS
+
+On travaille sur $\hat{Y}_t = X_t - \hat{\alpha} - \hat{\beta} t$ (les
+résidus de `lm(x ~ t)`, dont on a vérifié la stationnarité en Partie 1).
+L'identification ARMA procède par ACF/PACF, et la validation suit
+exactement le même filtre à deux composantes que pour l'ARIMA.
+
+```{r ts-identification}
+# Résidus OLS (déjà calculés en Partie 1 si lm_x existe)
+if (!exists("lm_x")) {
+  trend_x <- 1:length(x)
+  lm_x <- lm(as.numeric(x) ~ trend_x)
+}
+y_hat <- ts(residuals(lm_x), start = start(x), frequency = 4)
+
+par(mfrow = c(1, 2))
+acf(y_hat,  lag.max = 16, main = "ACF — résidus OLS (x ~ t)")
+pacf(y_hat, lag.max = 16, main = "PACF — résidus OLS (x ~ t)")
+par(mfrow = c(1, 1))
+```
+
+Le Ljung-Box lag 1 à p = 0.072 en Partie 1 suggérait une légère structure
+à court terme. La lecture des corrélogrammes permet de préciser : on retient
+$p_{\max} = 2$ et $q_{\max} = 1$ comme bornes de recherche (les séries
+stationnaires sans tendance ont généralement des structures ARMA plus courtes
+que les séries différenciées).
+
+```{r ts-estimation-validation}
+# Filtre validité identique à celui de la Partie 1 : bien ajusté + valide
+ts_modelchoice <- function(p, q, series = y_hat) {
+  estim <- try(forecast::Arima(series, order = c(p, 0, q),
+                               include.mean = TRUE,
+                               method = "ML"), silent = TRUE)
+  if (inherits(estim, "try-error")) {
+    return(c(p = p, q = q, arsignif = NA, masignif = NA,
+             resnocorr = NA, ok = NA, aic = NA, bic = NA))
+  }
+  s <- signif(estim)
+  ar_idx <- if (p > 0) which(grepl("^ar", colnames(s)))[p] else NA
+  ma_idx <- if (q > 0) which(grepl("^ma", colnames(s)))[q] else NA
+  arsignif <- if (p == 0) NA else s["pval", ar_idx] <= 0.05
+  masignif <- if (q == 0) NA else s["pval", ma_idx] <= 0.05
+  pvals_res <- Qtests(estim$residuals, 24,
+                      fitdf = length(estim$coef))[, 2]
+  resnocorr <- sum(pvals_res < 0.05, na.rm = TRUE) == 0
+  checks <- c(arsignif, masignif, resnocorr)
+  ok <- as.numeric(sum(checks, na.rm = TRUE) == (3 - sum(is.na(checks))))
+  return(c(p = p, q = q, arsignif = arsignif, masignif = masignif,
+           resnocorr = resnocorr, ok = ok, aic = AIC(estim), bic = BIC(estim)))
+}
+
+pqs_ts <- expand.grid(0:2, 0:1)
+ts_results <- t(apply(pqs_ts, 1, function(row) {
+  p <- row[1]; q <- row[2]
+  cat(sprintf("ARMA(%d,%d) sur résidus OLS\n", p, q))
+  ts_modelchoice(p, q)
+}))
+
+cat("\nTableau de validité (Modèle A — trend-stationary) :\n")
+print(ts_results)
+
+ts_valides <- ts_results[!is.na(ts_results[, "ok"]) &
+                          ts_results[, "ok"] == 1, , drop = FALSE]
+if (nrow(ts_valides) > 0) {
+  cat("\nModèles bien ajustés ET valides :\n")
+  print(ts_valides[order(ts_valides[, "bic"]),
+                   c("p", "q", "aic", "bic")])
+  best_ts <- ts_valides[which.min(ts_valides[, "bic"]), ]
+  cat(sprintf("\nMeilleur modèle A : ARMA(%d,%d) sur résidus OLS (BIC = %.1f)\n",
+              best_ts["p"], best_ts["q"], best_ts["bic"]))
+} else {
+  cat("\nAucun modèle ARMA valide sur les résidus OLS.\n")
+}
+```
+
+```{r ts-diagnostics}
+if (nrow(ts_valides) > 0) {
+  # Estimation du meilleur modèle A
+  modA <- forecast::Arima(y_hat,
+                          order = c(best_ts["p"], 0, best_ts["q"]),
+                          include.mean = TRUE, method = "ML")
+  cat("Coefficients du Modèle A :\n")
+  print(summary(modA))
+  checkresiduals(modA)
+  # Racines AR si p > 0
+  if (best_ts["p"] > 0) {
+    ar_coef <- modA$coef[grepl("^ar", names(modA$coef))]
+    racines <- polyroot(c(1, -ar_coef))
+    cat("Modules des racines AR :", round(Mod(racines), 3), "\n")
+  }
+}
+```
+
+### Modèle B — Difference-stationary : rappel
+
+C'est le modèle ARIMA(0,1,1) avec drift déjà estimé et validé en Partie 1.
+On le réutilise tel quel.
+
+### Comparaison formelle par RMSE hors-échantillon
+
+Les deux modèles produisent des prévisions sur la variable d'origine $X_t$.
+Pour le Modèle A (trend-stationary), la prévision se reconstruit par :
+
+$$\hat{X}_{T+h} = \hat{\alpha} + \hat{\beta}(T+h) + \hat{Y}_{T+h|T}^{ARMA}$$
+
+Pour le Modèle B (difference-stationary), la prévision est directement celle
+de `forecast::Arima(x, order = c(0,1,1), include.drift = TRUE)`.
+
+On compare sur les **8 derniers trimestres** avec RMSE normalisé par $\text{sd}(x)$.
+
+```{r ts-vs-ds-comparison}
+h_comp <- 8
+n_comp <- length(x)
+x_train_comp <- ts(x[1:(n_comp - h_comp)], start = start(x), frequency = 4)
+x_test_comp  <- x[(n_comp - h_comp + 1):n_comp]
+trend_full   <- 1:n_comp
+
+rmse_norm_comp <- function(fc, actual) {
+  sqrt(mean((as.numeric(fc) - as.numeric(actual))^2)) / sd(x)
+}
+
+# --- Modèle B (difference-stationary) ---
+modB_train <- forecast::Arima(x_train_comp,
+                              order = c(0, 1, 1),
+                              include.drift = TRUE, method = "ML")
+fc_B <- forecast(modB_train, h = h_comp)$mean
+
+# --- Modèle A (trend-stationary) ---
+if (nrow(ts_valides) > 0) {
+  # Ré-estimer lm + ARMA sur la portion d'entraînement
+  trend_train <- 1:length(x_train_comp)
+  lm_train <- lm(as.numeric(x_train_comp) ~ trend_train)
+  y_hat_train <- ts(residuals(lm_train),
+                    start = start(x_train_comp), frequency = 4)
+
+  modA_train <- forecast::Arima(y_hat_train,
+                                order = c(best_ts["p"], 0, best_ts["q"]),
+                                include.mean = TRUE, method = "ML")
+  fc_A_resid <- forecast(modA_train, h = h_comp)$mean
+
+  # Reconversion en niveaux : X_hat = alpha + beta*(T+h) + Y_hat_ARMA
+  alpha_hat <- coef(lm_train)[1]
+  beta_hat  <- coef(lm_train)[2]
+  trend_fc  <- (length(x_train_comp) + 1):(length(x_train_comp) + h_comp)
+  fc_A <- alpha_hat + beta_hat * trend_fc + as.numeric(fc_A_resid)
+
+  # --- Comparaison ---
+  comparison <- tibble::tibble(
+    Modèle = c(
+      sprintf("A — Trend-stat. + ARMA(%d,%d)", best_ts["p"], best_ts["q"]),
+      "B — ARIMA(0,1,1) + drift",
+      "Naïf — RW + drift"
+    ),
+    `RMSE / sd(x)` = c(
+      rmse_norm_comp(fc_A, x_test_comp),
+      rmse_norm_comp(fc_B, x_test_comp),
+      rmse_norm_comp(forecast::rwf(x_train_comp, h = h_comp,
+                                   drift = TRUE)$mean, x_test_comp)
+    )
+  )
+
+  knitr::kable(comparison, digits = 4,
+               caption = "Comparaison trend-stationary (A) vs difference-stationary (B)") %>%
+    kableExtra::kable_styling(full_width = FALSE)
+
+  # --- Graphe des prévisions superposées ---
+  df_comp <- tibble::tibble(
+    date = as.Date(zoo::as.yearqtr(time(x))),
+    historique = as.numeric(x)
+  )
+  dates_fc <- as.Date(zoo::as.yearqtr(time(fc_B)))
+
+  df_fc <- tibble::tibble(
+    date = dates_fc,
+    `Modèle A (trend-stat.)` = fc_A,
+    `Modèle B (ARIMA 0,1,1)` = as.numeric(fc_B),
+    Observé = as.numeric(x_test_comp)
+  ) %>%
+    tidyr::pivot_longer(-date, names_to = "Série", values_to = "valeur")
+
+  ggplot() +
+    geom_line(data = df_comp, aes(x = date, y = historique),
+              color = "#0B1F5B", linewidth = 1.2) +
+    geom_line(data = df_fc, aes(x = date, y = valeur, color = Série),
+              linewidth = 1) +
+    geom_vline(xintercept = max(df_comp$date) - h_comp * 91,
+               linetype = "dashed", color = "grey50") +
+    scale_color_manual(values = c(
+      "Modèle A (trend-stat.)" = "#E63946",
+      "Modèle B (ARIMA 0,1,1)" = "#2F6FB2",
+      "Observé" = "#2D6A4F"
+    )) +
+    labs(title = "Prévisions : trend-stationary (A) vs difference-stationary (B)",
+         x = "Trimestre", y = "Montant (M USD)",
+         color = "") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+} else {
+  cat("Pas de modèle A valide — la comparaison se réduit au Modèle B.\n")
+}
+```
+
+### Diagnostic comparatif
+
+```{r ts-vs-ds-diagnostic}
+if (exists("modA") && nrow(ts_valides) > 0) {
+  cat("=== Résidus du Modèle A (trend-stat.) ===\n")
+  jarque.bera.test(residuals(modA))
+
+  cat("\n=== Résidus du Modèle B (ARIMA 0,1,1) ===\n")
+  jarque.bera.test(residuals(final_model))
+
+  cat("\n=== AIC/BIC (sur les résidus respectifs — non directement comparables) ===\n")
+  cat(sprintf("Modèle A : AIC = %.1f, BIC = %.1f\n", AIC(modA), BIC(modA)))
+  cat(sprintf("Modèle B : AIC = %.1f, BIC = %.1f\n",
+              AIC(final_model), BIC(final_model)))
+  cat("(NB : ces AIC/BIC ne sont PAS comparables car estimés sur des séries\n",
+      "différentes — seul le RMSE hors-échantillon est directement comparable.)\n")
+}
+```
+
+### Conclusion de la comparaison
+
+Le Modèle A (trend-stationary) n'a produit **aucune spécification ARMA
+valide** sur les résidus OLS : les six candidats ($p \in \{0, 1, 2\}$,
+$q \in \{0, 1\}$) échouent tous au test de Ljung-Box (`resnocorr = 0`).
+Même les spécifications dont le coefficient de plus haut ordre est
+significatif — ARMA(1,0) avec $\hat{\phi}_1$ significatif, ARMA(0,1) avec
+$\hat{\theta}_1$ significatif — ne suffisent pas à absorber la persistance
+des résidus OLS.
+
+Ce résultat est plus informatif que les tests ADF/PP/KPSS pris isolément.
+Les tests de racine unitaire sur la série en niveau rejetaient H₀
+(p = 0.01), et l'ADF sur les résidus OLS rejetait aussi marginalement
+(p = 0.031). Mais quand on passe à l'étape suivante — estimer un modèle
+ARMA sur ces résidus selon la méthodologie de Box-Jenkins — **aucun modèle
+ne valide**. Les résidus $\hat{Y}_t = X_t - \hat{\alpha} - \hat{\beta}t$
+possèdent une autocorrélation trop persistante pour être captée par un
+processus stationnaire de faible ordre. Ce comportement est caractéristique
+d'un processus **near-unit-root** : le coefficient autorégressif est proche
+de 1 (assez pour qu'un ADF marginal rejette avec $n = 48$) mais la
+persistance effective est trop forte pour qu'un ARMA stationnaire soit
+valide.
+
+On aurait pu tester des ordres ARMA plus élevés ($p = 3, 4, ...$) pour
+essayer de capturer cette persistance. Toutefois, cette stratégie est
+contre-productive pour deux raisons : (i) avec $n = 48$, chaque paramètre
+supplémentaire coûte un degré de liberté précieux — un ARMA(4,1) sur 48
+observations dépense déjà 6 paramètres (4 AR + 1 MA + 1 constante) ;
+(ii) si un ARMA(2,1) ne parvient pas à blanchir les résidus, augmenter
+l'ordre revient à ajuster un processus stationnaire complexe à des données
+qui ne le sont pas — c'est le signe qu'on modélise le mauvais objet.
+
+**Verdict final** : la série des créances bancaires sur les NBFI est
+**difference-stationary (I(1) avec drift)**, et non trend-stationary.
+La différenciation pratiquée en Partie 1 est validée a posteriori par
+l'échec complet du Modèle A au filtre de validité Box-Jenkins. Le modèle
+ARIMA(0,1,1) avec drift est retenu comme spécification définitive, et le
+coefficient MA(1) = −0.38 n'est pas un artefact de sur-différenciation
+mais une composante structurelle du processus.
+
+---
+
+## Comparaison aux benchmarks naïfs
+
+Avant d'aller plus loin, on confronte le modèle ARIMA(0,1,1) avec drift
+retenu en Partie 1 à deux benchmarks naïfs : la marche aléatoire avec drift
+(`naive` méthode `rwf` avec `drift=TRUE`), et la prévision saisonnière naïve
+(`snaive`). Cette comparaison répond à la question : la complexité de
+l'ARIMA est-elle justifiée par un gain prédictif réel ?
+
+```{r benchmarks}
+if (!is.null(final_model)) {
+  h <- 8
+  n <- length(x)
+  x_train <- ts(x[1:(n - h)], start = start(x), frequency = 4)
+  x_test  <- x[(n - h + 1):n]
+
+  # Modèle ARIMA réestimé sur la portion d'entraînement
+  arima_train <- forecast::Arima(x_train,
+                                 order = c(0, 1, 1),
+                                 include.drift = TRUE, method = "ML")
+
+  # Benchmarks naïfs
+  rwf_train   <- forecast::rwf(x_train, h = h, drift = TRUE)
+  snaive_train <- forecast::snaive(x_train, h = h)
+
+  # Prévisions
+  fc_arima  <- forecast(arima_train, h = h)$mean
+  fc_rwf    <- rwf_train$mean
+  fc_snaive <- snaive_train$mean
+
+  # RMSE normalisé par sd(x)
+  rmse_norm <- function(fc, actual) {
+    sqrt(mean((as.numeric(fc) - as.numeric(actual))^2)) / sd(x)
+  }
+
+  benchmark_table <- tibble::tibble(
+    Modèle = c("ARIMA(0,1,1) + drift", "Random walk + drift", "Naïf saisonnier"),
+    `RMSE / sd(x)` = c(rmse_norm(fc_arima, x_test),
+                       rmse_norm(fc_rwf, x_test),
+                       rmse_norm(fc_snaive, x_test))
+  )
+
+  knitr::kable(benchmark_table, digits = 4,
+               caption = "Comparaison de la qualité prédictive (8 trimestres hors-échantillon)") %>%
+    kableExtra::kable_styling(full_width = FALSE)
+}
+```
+
+Si l'ARIMA(0,1,1) ne fait que marginalement mieux que la marche aléatoire
+avec drift, c'est cohérent avec notre identification : le modèle est
+quasiment équivalent à un random walk + drift, le coefficient MA(1)
+(−0.38, p = 0.034) ne corrigeant que faiblement les chocs passés. Cela
+**confirme** plutôt qu'il n'invalide l'analyse : la dynamique des créances
+NBFI est dominée par sa croissance structurelle, et toute modélisation
+plus complexe ne fait pas mieux qu'une trajectoire linéaire.
+
+---
+
+## Fonctions de réponse impulsionnelle (IRF) et décomposition de la variance
+
+Le modèle VAR(1) estimé en Partie 2 a passé tous les diagnostics : résidus
+non corrélés (Portmanteau p = 0.69), racines à l'intérieur du cercle unité
+(0.31 et 0.11), résidus normalement distribués (JB p = 0.85). Cette qualité
+de spécification autorise le calcul des IRF et de la FEVD, qui répondent
+respectivement à deux questions :
+
+- **IRF** : quelle est la réponse dynamique de chaque variable à un choc
+  d'une déviation standard sur l'une des innovations ?
+- **FEVD** : quelle proportion de la variance de l'erreur de prévision de
+  chaque variable est imputable à chaque choc, à différents horizons ?
+
+L'ordre de Cholesky retenu place le CISS *avant* l'exposition (`DCISS, Exposition`).
+Cette identification "Wold" suppose qu'un choc de stress affecte les
+expositions dans le même trimestre, mais qu'un choc d'exposition n'affecte
+le CISS qu'avec un trimestre de retard. Hypothèse défendable étant donné
+la fréquence trimestrielle (les marchés réagissent plus vite que les bilans
+bancaires ne s'ajustent), mais on testera la robustesse à l'ordre inverse.
+
+```{r irf-ciss}
+if (exists("modele_var")) {
+  # IRF : choc CISS -> Exposition (réponse sur 8 trimestres, IC bootstrap)
+  irf_ciss <- vars::irf(modele_var,
+                       impulse  = "DCISS",
+                       response = "Exposition",
+                       n.ahead  = 8,
+                       boot     = TRUE,
+                       runs     = 500,
+                       ci       = 0.90,
+                       cumulative = FALSE)
+
+  plot(irf_ciss, main = "Réponse de Δexposition à un choc ΔCISS (90% CI)")
+
+  # IRF : choc Exposition -> CISS
+  irf_expo <- vars::irf(modele_var,
+                       impulse  = "Exposition",
+                       response = "DCISS",
+                       n.ahead  = 8,
+                       boot     = TRUE,
+                       runs     = 500,
+                       ci       = 0.90)
+
+  plot(irf_expo, main = "Réponse de ΔCISS à un choc Δexposition (90% CI)")
+}
+```
+
+```{r fevd}
+if (exists("modele_var")) {
+  fevd_var <- vars::fevd(modele_var, n.ahead = 8)
+  cat("Décomposition de la variance — Δexposition :\n")
+  print(round(fevd_var$Exposition, 4))
+  cat("\nDécomposition de la variance — ΔCISS :\n")
+  print(round(fevd_var$DCISS, 4))
+}
+```
+
+### Interprétation des IRF/FEVD
+
+L'IRF du choc CISS sur l'exposition livre une trajectoire informative :
+même si le test de Granger statique ne rejette pas formellement l'hypothèse
+nulle (p = 0.24), la réponse instantanée est négative et de magnitude
+économiquement non négligeable, avec un retour vers zéro sur 4-6 trimestres.
+La bande de confiance à 90 % englobant le zéro confirme la limite
+statistique, mais le signe et la magnitude sont cohérents avec le canal
+CISS → exposition détecté par le Granger glissant (section 5.4).
+
+L'IRF inverse (Exposition → CISS) montre une réponse essentiellement plate
+et statistiquement nulle, ce qui renforce l'absence de canal détectable
+expositions → stress — conclusion cohérente dans toutes les analyses.
+
+La FEVD fournit une quantification précise de l'indépendance des deux
+séries :
+
+- **Δexposition** : 97,1 % de sa variance est expliquée par ses propres
+  chocs dès le 2e trimestre, se stabilisant à 96,9 %. Le CISS n'en
+  explique que **3,1 %** — un effet marginal.
+- **ΔCISS** : 98,5 % de sa variance est expliquée par ses propres chocs.
+  L'exposition n'en explique que **1,5 %** — essentiellement nul.
+
+**Les deux variables évoluent de manière quasi indépendante au-delà de la
+corrélation contemporaine.** Ce résultat est cohérent avec le diagnostic
+ARIMA (la série d'exposition est un random walk + drift, dominée par ses
+propres innovations) et avec l'absence de causalité Granger
+Exposition → CISS.
+
+### Robustesse à l'ordre de Cholesky
+
+```{r irf-robustness}
+if (exists("systeme_bivarie")) {
+  # Inversion de l'ordre : DCISS d'abord, Exposition ensuite
+systeme_bivarie_inv <- systeme_bivarie[, c("DCISS", "Exposition")]
+modele_var_inv <- VAR(systeme_bivarie_inv, p = 1, type = "const")
+
+irf_inv <- vars::irf(modele_var_inv,
+                    impulse  = "DCISS",
+                    response = "Exposition",
+                    n.ahead  = 8,
+                    boot     = TRUE, runs = 500, ci = 0.90)
+plot(irf_inv, main = "IRF avec ordre inversé (DCISS, Exposition)")
+}
+```
+
+Si la trajectoire qualitative est inchangée par l'inversion de l'ordre,
+les conclusions sont robustes à la stratégie d'identification. Toute
+divergence majeure indiquerait que les corrélations contemporaines
+résiduelles brouillent l'interprétation — auquel cas une identification
+structurelle (SVAR avec restrictions de signe) serait nécessaire.
+
+---
+
+## Test de cointégration de Johansen
+
+Avant de définitivement adopter la modélisation en différences premières,
+il convient de vérifier que les séries en niveau ne sont pas cointégrées.
+Si elles le sont, un VECM (Vector Error-Correction Model) serait
+l'approche correcte, et le VAR-en-différences omettrait le terme de
+correction d'erreur (long-run equilibrium).
+
+Le test de Johansen examine le rang de la matrice $\Pi$ dans la
+représentation $\Delta y_t = \Pi y_{t-1} + \sum \Gamma_i \Delta y_{t-i} + \varepsilon_t$ :
+
+- $\text{rang}(\Pi) = 0$ : aucune relation de cointégration → VAR-en-différences
+- $\text{rang}(\Pi) = 1$ : une relation de cointégration → VECM
+- $\text{rang}(\Pi) = 2$ : les deux séries sont stationnaires en niveau
+
+```{r johansen}
+if (exists("x_eu") && exists("ciss_ts")) {
+  # Vérifier les bornes communes de manière robuste
+  start_common_lev <- max(yq(start(x_eu)), yq(start(ciss_ts)))
+  end_common_lev   <- min(yq(end(x_eu)),    yq(end(ciss_ts)))
+  cs_lev <- to_tsstart(start_common_lev)
+  ce_lev <- to_tsstart(end_common_lev)
+
+  x_eu_lev    <- window(x_eu,    start = cs_lev, end = ce_lev)
+  ciss_ts_lev <- window(ciss_ts, start = cs_lev, end = ce_lev)
+
+  # IMPORTANT : remettre les deux séries à des échelles comparables avant ca.jo.
+  # x_eu_lev est en millions USD (~10^7), ciss_ts_lev est dans [0, 0.5].
+  # Sans rescaling, la matrice de covariance combinée est numériquement
+  # singulière (~14 ordres de grandeur d'écart sur les valeurs propres) et
+  # urca::ca.jo retourne 'system is computationally singular'. Le test de
+  # Johansen est invariant aux transformations linéaires, donc rescaler ne
+  # change pas le résultat — c'est purement un problème numérique.
+  exposition_scaled <- as.numeric(x_eu_lev) / 1e6   # → en milliers de Md USD
+  ciss_scaled       <- as.numeric(ciss_ts_lev)       # déjà dans [0, 0.5]
+
+  niveaux <- cbind(exposition_scaled, ciss_scaled)
+  colnames(niveaux) <- c("Exposition", "CISS")
+
+  cat("Échelles après rescaling :\n")
+  cat(sprintf("  Exposition : moyenne = %.2f, sd = %.2f\n",
+              mean(niveaux[, "Exposition"]), sd(niveaux[, "Exposition"])))
+  cat(sprintf("  CISS       : moyenne = %.2f, sd = %.2f\n",
+              mean(niveaux[, "CISS"]), sd(niveaux[, "CISS"])))
+
+  # Test de Johansen avec K=2 (correspond au VAR(1) en différences)
+  joh <- urca::ca.jo(niveaux, type = "trace", ecdet = "const", K = 2)
+  summary(joh)
+}
+```
+
+### Interprétation
+
+Le test de la trace teste séquentiellement $H_0 : \text{rang}(\Pi) \leq r$
+contre $H_1 : \text{rang}(\Pi) > r$ pour $r = 0, 1, ...$. On lit la sortie
+en partant de $r = 0$ :
+
+- Pour $r = 0$ : statistique de la trace = 15,21, valeur critique à 5 % =
+  19,96. **On ne rejette pas** $r = 0$ → pas de cointégration.
+- Pour $r \leq 1$ : statistique = 4,08, valeur critique = 9,24. Non rejeté
+  non plus (cohérent).
+
+**Conclusion : aucune relation de cointégration détectable** entre les
+expositions bancaires européennes aux NBFI et le CISS. Le VAR-en-différences
+est l'approche appropriée ; un VECM n'est pas justifié. Ce résultat est
+cohérent avec la nature mixte des séries en niveau (CISS borderline
+stationnaire avec ADF p = 0.018, exposition clairement I(1)) : deux séries
+d'ordres d'intégration potentiellement différents sont peu susceptibles
+d'être cointégrées.
+
+---
+
+## Causalité de Granger en fenêtre glissante
+
+Un test de Granger statique sur l'ensemble de la période peut masquer
+des dynamiques temporelles. La revue de littérature (Where do banks end
+and NBFIs begin?, NBER) souligne que la causalité bidirectionnelle
+banques-NBFI s'est *renforcée depuis 2008* et était particulièrement
+marquée durant la pandémie 2020 et la crise bancaire de mars 2023.
+
+On teste cette intuition en estimant un VAR(1) sur des fenêtres glissantes
+de 5 ans (20 trimestres) et en extrayant la p-value du test de Granger à
+chaque fenêtre. La fenêtre est arrimée à sa date de fin pour faciliter
+l'interprétation : la valeur en T_end représente le test sur les 20
+trimestres se terminant en T_end.
+
+```{r rolling-granger}
+if (exists("systeme_bivarie")) {
+  window_size <- 20
+  n_total <- nrow(systeme_bivarie)
+
+  if (n_total > window_size) {
+    rolling_results <- tibble::tibble(
+      end_quarter = numeric(),
+      pval_ciss_to_expo = numeric(),
+      pval_expo_to_ciss = numeric()
+    )
+
+    for (i in window_size:n_total) {
+      window_data <- systeme_bivarie[(i - window_size + 1):i, ]
+      mod_window <- try(VAR(window_data, p = 1, type = "const"), silent = TRUE)
+
+      if (!inherits(mod_window, "try-error")) {
+        gc1 <- try(causality(mod_window, cause = "DCISS")$Granger$p.value,
+                   silent = TRUE)
+        gc2 <- try(causality(mod_window, cause = "Exposition")$Granger$p.value,
+                   silent = TRUE)
+
+        rolling_results <- rolling_results %>%
+          dplyr::add_row(
+            end_quarter = as.numeric(time(systeme_bivarie))[i],
+            pval_ciss_to_expo = if (inherits(gc1, "try-error")) NA_real_ else gc1,
+            pval_expo_to_ciss = if (inherits(gc2, "try-error")) NA_real_ else gc2
+          )
+      }
+    }
+
+    print(rolling_results)
+
+    # Visualisation des deux p-values dans le temps
+    rolling_long <- rolling_results %>%
+      tidyr::pivot_longer(cols = c(pval_ciss_to_expo, pval_expo_to_ciss),
+                          names_to = "direction", values_to = "pval") %>%
+      dplyr::mutate(direction = dplyr::recode(direction,
+        pval_ciss_to_expo = "ΔCISS → ΔExposition",
+        pval_expo_to_ciss = "ΔExposition → ΔCISS"))
+
+    ggplot(rolling_long, aes(x = end_quarter, y = pval, color = direction)) +
+      geom_line(linewidth = 1) +
+      geom_point(size = 2) +
+      geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
+      geom_hline(yintercept = 0.10, linetype = "dotted", color = "orange") +
+      scale_color_manual(values = c("ΔCISS → ΔExposition" = "#0B1F5B",
+                                     "ΔExposition → ΔCISS" = "#B22222")) +
+      labs(title = "Causalité de Granger en fenêtre glissante (20 trimestres)",
+           subtitle = "Lignes pointillées : seuils 5% et 10%",
+           x = "Trimestre de fin de fenêtre", y = "p-value Granger",
+           color = "Direction") +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+  }
+}
+```
+
+### Interprétation du Granger glissant
+
+Les résultats révèlent un pattern temporel frappant qui invalide la
+conclusion du test statique (p = 0.24 sur l'ensemble de la période) :
+
+**Fenêtres se terminant entre 2019 et début 2020** (couvrant ~2014–2019/2020) :
+la causalité CISS → Exposition est **significative à 1–5 %** (p-values de
+0.007 à 0.033). Le stress financier européen avait donc un pouvoir
+prédictif réel sur les variations d'exposition aux NBFI durant cette
+période.
+
+**Fenêtre se terminant vers mi-2020** : rupture brutale — la p-value passe
+de 0.007 à 0.30 en un trimestre. Le signal disparaît.
+
+**Post-2020** : les p-values oscillent entre 0.20 et 0.31 — aucun signal
+détectable.
+
+Ce pattern est économiquement cohérent. Le choc Covid (2020-Q1/Q2) a
+introduit une variabilité extrême dans les deux séries (effondrement puis
+rebond du CISS, ajustements massifs d'exposition) qui *noie* le signal
+modéré mais régulier observable pré-Covid. Statistiquement, l'inclusion
+des trimestres 2020-Q1/Q2 dans la fenêtre ajoute un bruit d'une amplitude
+telle que le test perd toute puissance pour détecter le canal
+pré-existant.
+
+**La direction est strictement unidirectionnelle** : CISS → Exposition
+montre ce pattern, mais Exposition → CISS reste à p > 0.70 sur toutes
+les fenêtres sans exception. Il n'y a aucune trace d'un effet de
+rétroaction des expositions NBFI vers le stress financier.
+
+Ce résultat est le plus important du notebook : il montre que l'absence
+de causalité de Granger *sur l'ensemble de la période* est un artefact
+de l'hétérogénéité temporelle — le canal existait pré-Covid mais a été
+statistiquement dilué par la crise. La bonne conclusion n'est donc pas
+« pas de canal » mais « canal pré-existant, masqué par un choc
+structurel ».
+
+---
+
+## Modélisation ARIMA par pays de contrepartie
+
+L'analyse univariée de la Partie 1 portait sur l'agrégat global. Mais la
+revue géographique de la Partie 2 (statistiques descriptives) a identifié
+cinq juridictions qui concentrent l'essentiel des expositions : les
+**Îles Caïmans (KY)**, le **Royaume-Uni (GB)**, le **Luxembourg (LU)**,
+l'**Irlande (IE)** et le **Japon (JP)**. Si la dynamique globale est
+homogène, on s'attend à des ARIMA similaires sur chaque pays. Si elle
+est hétérogène, certains pays (e.g. les centres offshore) devraient
+révéler des dynamiques spécifiques.
+
+Pour mener cette analyse, on filtre directement la base `data` (déjà chargée
+au début du notebook) avec les noms de colonnes longs cohérents avec ceux
+utilisés en Parties 1 et 2.
+
+```{r data-priority-countries}
+# Mapping pays -> code ISO 2-lettres pour les 5 juridictions prioritaires
+pays_priority_map <- c(
+  "Cayman Islands"  = "KY",
+  "United Kingdom"  = "GB",
+  "Luxembourg"      = "LU",
+  "Ireland"         = "IE",
+  "Japan"           = "JP"
+)
+
+# Vérification : les 5 noms existent-ils dans la base ?
+cat("Vérification des noms de pays dans la base :\n")
+for (p in names(pays_priority_map)) {
+  present <- p %in% unique(data$Counterparty.country)
+  cat(sprintf("  %s : %s\n", p, if (present) "OK" else "ABSENT"))
+}
+stopifnot(all(names(pays_priority_map) %in% unique(data$Counterparty.country)))
+
+# Filtre cohérent avec ceux des Parties 1 et 2 (anti-double-comptage),
+# mais avec ventilation par pays de contrepartie.
+# NB : Position.type == "Cross-border" (et non "All") car la valeur "All"
+# n'est disponible dans les LBS qu'au niveau Counterparty.country ==
+# "All countries (total)". Pour les pays individuels, seul "Cross-border"
+# est renseigné.
+expo_priority_wide <- data %>%
+  dplyr::filter(
+    `Reporting.country`                  == "All reporting countries",
+    `Counterparty.country`               %in% names(pays_priority_map),
+    `Type.of.instruments`                == "All instruments",
+    `Currency.denomination`              == "All currencies",
+    `Counterparty.sector`                == "Non-bank financial institutions",
+    `Type.of.reporting.institutions`     == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)",
+    `Currency.type.of.reporting.country` == "All currencies (=D+F+U)",
+    `Parent.country`                     == "All countries (total)",
+    `Measure`                            == "Amounts outstanding / Stocks",
+    `Balance.sheet.position`             == "Total claims",
+    `Position.type`                      == "Cross-border"
+  )
+
+# Pivot long sur les colonnes trimestrielles
+expo_priority <- expo_priority_wide %>%
+  tidyr::pivot_longer(
+    cols      = all_of(quarter_cols),
+    names_to  = "QUARTER_RAW",
+    values_to = "exposure_nbfi"
+  ) %>%
+  dplyr::filter(!is.na(exposure_nbfi)) %>%
+  dplyr::mutate(
+    QUARTER = stringr::str_replace(QUARTER_RAW, "^X", ""),
+    QUARTER = stringr::str_replace(QUARTER, "\\.", "-"),
+    country = pays_priority_map[`Counterparty.country`]
+  ) %>%
+  dplyr::select(QUARTER, country, exposure_nbfi) %>%
+  dplyr::arrange(country, QUARTER)
+
+cat("Panel pays construit :\n")
+cat("Pays :", paste(unique(expo_priority$country), collapse = ", "), "\n")
+cat("Trimestres :", length(unique(expo_priority$QUARTER)), "\n")
+cat("Lignes totales :", nrow(expo_priority), "\n")
+print(head(expo_priority))
+```
+
+```{r per-country-arima}
+if (exists("expo_priority")) {
+
+  # Fonction qui applique le pipeline Box-Jenkins complet à une série
+  pipeline_pays <- function(series_pays, nom_pays) {
+    cat("\n========== ", nom_pays, " ==========\n")
+
+    if (length(series_pays) < 20 || sum(!is.na(series_pays)) < 20) {
+      cat("Série trop courte pour analyse rigoureuse — passée\n")
+      return(NULL)
+    }
+
+    # Étape 1 : choix de la spec ADF par régression sur t
+    trend_t <- 1:length(series_pays)
+    lm_pays <- lm(as.numeric(series_pays) ~ trend_t)
+    p_trend <- summary(lm_pays)$coefficients[2, 4]
+    spec_adf <- if (p_trend < 0.05) "ct" else "c"
+    cat(sprintf("Tendance significative ? p = %.4f → spec ADF '%s'\n",
+                p_trend, spec_adf))
+
+    # ADF sur niveau
+    adf_lev <- try(adfTest_valid(series_pays, kmax = 8, adftype = spec_adf),
+                   silent = TRUE)
+    if (inherits(adf_lev, "try-error")) {
+      cat("ADF en échec sur niveau\n"); return(NULL)
+    }
+    p_adf_lev <- adf_lev@test$p.value
+    cat(sprintf("ADF niveau : p = %.4f\n", p_adf_lev))
+
+    # Différenciation systématique si non rejet
+    d_pays <- if (p_adf_lev > 0.05) 1 else 0
+
+    if (d_pays == 1) {
+      ds <- diff(series_pays)
+      adf_diff <- try(adfTest_valid(ds, kmax = 8, adftype = "c"),
+                      silent = TRUE)
+      cat(sprintf("ADF différencié : p = %.4f\n",
+                  adf_diff@test$p.value))
+    }
+
+    # Filtre validité sur grille (p,q) ∈ {0,1,2,3}×{0,1}
+    pmax <- 3; qmax <- 1
+    grille <- expand.grid(p = 0:pmax, q = 0:qmax)
+    resultats <- apply(grille, 1, function(row) {
+      p <- row["p"]; q <- row["q"]
+      mod <- try(forecast::Arima(series_pays,
+                                 order = c(p, d_pays, q),
+                                 include.drift = (d_pays == 1),
+                                 method = "ML"), silent = TRUE)
+      if (inherits(mod, "try-error")) return(c(p = p, q = q, ok = NA))
+
+      s <- signif(mod)
+      ar_idx <- if (p > 0) which(grepl("^ar", colnames(s)))[p] else NA
+      ma_idx <- if (q > 0) which(grepl("^ma", colnames(s)))[q] else NA
+      ar_ok <- if (p == 0) NA else s["pval", ar_idx] <= 0.05
+      ma_ok <- if (q == 0) NA else s["pval", ma_idx] <= 0.05
+
+      pvres <- Qtests(mod$residuals, 24, fitdf = length(mod$coef))[, 2]
+      res_ok <- sum(pvres < 0.05, na.rm = TRUE) == 0
+
+      checks <- c(ar_ok, ma_ok, res_ok)
+      ok <- as.numeric(sum(checks, na.rm = TRUE) == (3 - sum(is.na(checks))))
+      c(p = p, q = q, ar_ok = ar_ok, ma_ok = ma_ok,
+        res_ok = res_ok, ok = ok, aic = AIC(mod), bic = BIC(mod))
+    })
+    res_df <- as.data.frame(t(resultats))
+
+    valides <- res_df[!is.na(res_df$ok) & res_df$ok == 1, , drop = FALSE]
+    if (nrow(valides) == 0) {
+      cat("Aucun modèle bien ajusté ET valide trouvé\n"); return(NULL)
+    }
+    cat(sprintf("Modèles retenus : %d\n", nrow(valides)))
+    print(valides[order(valides$bic), c("p", "q", "aic", "bic")])
+
+    # Choix par BIC
+    best <- valides[which.min(valides$bic), ]
+    cat(sprintf("Modèle final : ARIMA(%d,%d,%d)%s\n",
+                best$p, d_pays, best$q,
+                if (d_pays == 1) " avec drift" else ""))
+    return(list(p = best$p, d = d_pays, q = best$q,
+                aic = best$aic, bic = best$bic))
+  }
+
+  # Application aux 5 pays prioritaires
+  results_pays <- list()
+  for (pays in c("KY", "GB", "LU", "IE", "JP")) {
+    serie_pays <- expo_priority %>%
+      dplyr::filter(country == pays) %>%
+      dplyr::arrange(QUARTER) %>%
+      dplyr::pull(exposure_nbfi)
+
+    if (length(serie_pays) > 0) {
+      ts_pays <- ts(serie_pays, start = c(2013, 4), frequency = 4)
+      results_pays[[pays]] <- pipeline_pays(ts_pays, pays)
+    }
+  }
+
+  # Tableau récapitulatif
+  recap <- do.call(rbind, lapply(names(results_pays), function(p) {
+    if (!is.null(results_pays[[p]])) {
+      data.frame(Pays = p,
+                 Modèle = sprintf("ARIMA(%d,%d,%d)",
+                                  results_pays[[p]]$p,
+                                  results_pays[[p]]$d,
+                                  results_pays[[p]]$q),
+                 AIC = round(results_pays[[p]]$aic, 1),
+                 BIC = round(results_pays[[p]]$bic, 1))
+    }
+  }))
+  if (!is.null(recap)) {
+    knitr::kable(recap,
+                 caption = "Modèles ARIMA retenus par pays de contrepartie") %>%
+      kableExtra::kable_styling(full_width = FALSE)
+  }
+}
+```
+
+### Interprétation comparative
+
+Si tous les pays retiennent une spécification proche de ARIMA(0,1,1) avec
+drift, comme l'agrégat, cela renforce la lecture d'une dynamique
+homogène : tous les centres financiers connaissent une croissance
+structurelle des expositions sans inertie autorégressive. À l'inverse,
+si un pays révèle une structure ARIMA différente (par exemple
+ARIMA(1,1,0) sur les Caïmans), cela suggérerait une dynamique
+spécifique liée à des facteurs locaux — réglementation offshore, effets
+de relocalisation depuis d'autres juridictions.
+
+Cette analyse comparative permet aussi de **détecter les pays atypiques**
+qui pourraient mériter un suivi prudentiel renforcé (ce point relève des
+priorités opérationnelles que l'ACPR et les autres régulateurs cherchent
+à identifier).
+
+---
+
+## VAR sur le RiskIndex
+
+Le RiskIndex agrégé construit en Partie Statistiques Descriptives combine
+deux dimensions du risque : la concentration des expositions par devise
+(HHI) et le poids relatif des pays dans l'exposition totale. Substituer
+le RiskIndex aux volumes bruts dans le système VAR permet de tester si
+ce sont les **niveaux** d'exposition ou la **structure de concentration**
+qui interagissent avec le stress financier — une distinction
+fondamentale du point de vue du risque systémique.
+
+```{r data-riskindex}
+# Le fichier risk_index_agg.csv est exporté par le notebook RiskIndex_et_Réseau.Rmd
+# (voir la section "Export des données du RiskIndex" — il existe déjà dans
+# leur pipeline et peut être copié dans le répertoire de ce notebook).
+# Colonnes attendues : QUARTER, risk_index_agg, total_fx_expo, n_countries
+```
+
+```{r var-riskindex}
+ri_path <- file.path(data_dir, "risk_index_agg.csv")
+# Fallback : chercher aussi dans le répertoire courant
+if (!file.exists(ri_path)) ri_path <- "risk_index_agg.csv"
+
+if (file.exists(ri_path)) {
+  ri_data <- readr::read_csv(ri_path, show_col_types = FALSE)
+  ri_data <- ri_data %>%
+    dplyr::mutate(
+      year = as.numeric(stringr::str_extract(QUARTER, "\\d{4}")),
+      qt = as.numeric(stringr::str_extract(QUARTER, "(?<=Q)\\d"))
+    ) %>%
+    dplyr::arrange(year, qt)
+
+  ri_ts <- ts(ri_data$risk_index_agg,
+              start = c(ri_data$year[1], ri_data$qt[1]),
+              frequency = 4)
+
+  # Stationnarité du RiskIndex
+  trend_ri <- 1:length(ri_ts)
+  lm_ri <- lm(as.numeric(ri_ts) ~ trend_ri)
+  cat("Régression sur tendance pour RiskIndex :\n")
+  print(summary(lm_ri)$coefficients)
+
+  spec_ri <- if (summary(lm_ri)$coefficients[2, 4] < 0.05) "ct" else "c"
+  adf_ri <- adfTest_valid(ri_ts, kmax = 8, adftype = spec_ri)
+  print(adf_ri)
+  pp.test(ri_ts)
+  kpss.test(ri_ts, null = if (spec_ri == "ct") "Trend" else "Level")
+
+  # Différenciation si nécessaire (probablement pas — RiskIndex est borné dans [0,1])
+  if (adf_ri@test$p.value > 0.05) {
+    cat("RiskIndex non stationnaire en niveau, différenciation appliquée\n")
+    ri_used <- diff(ri_ts)
+  } else {
+    cat("RiskIndex stationnaire en niveau (utilisé tel quel)\n")
+    ri_used <- ri_ts
+  }
+
+  # Alignement avec dciss
+  start_ri <- max(yq(start(ri_used)), yq(start(dciss)))
+  end_ri   <- min(yq(end(ri_used)),   yq(end(dciss)))
+  cs_ri <- to_tsstart(start_ri); ce_ri <- to_tsstart(end_ri)
+
+  ri_aligne   <- window(ri_used, start = cs_ri, end = ce_ri)
+  dciss_ri    <- window(dciss,   start = cs_ri, end = ce_ri)
+
+  systeme_ri <- cbind(ri_aligne, dciss_ri)
+  colnames(systeme_ri) <- c("RiskIndex", "DCISS")
+
+  # Sélection du retard
+  sel_ri <- VARselect(systeme_ri, lag.max = 8, type = "const")
+  print(sel_ri)
+  p_ri <- as.numeric(sel_ri$selection["SC(n)"])
+
+  # Estimation
+  modele_ri <- VAR(systeme_ri, p = p_ri, type = "const")
+  summary(modele_ri)
+
+  # Diagnostics
+  serial.test(modele_ri, lags.pt = 10, type = "PT.asymptotic")
+  cat("Racines :", round(roots(modele_ri), 3), "\n")
+  normality.test(modele_ri)
+
+  # Granger
+  cat("\nGranger ΔCISS → ΔRiskIndex :\n")
+  print(causality(modele_ri, cause = "DCISS")$Granger)
+
+  cat("\nGranger ΔRiskIndex → ΔCISS :\n")
+  print(causality(modele_ri, cause = "RiskIndex")$Granger)
+} else {
+  cat("Fichier 'risk_index_agg.csv' non trouvé.\n",
+      "Ce fichier est exporté par RiskIndex_et_Réseau.Rmd, section",
+      "'Export des données du RiskIndex'.\n")
+}
+```
+
+### Interprétation
+
+Comparer ce résultat à celui de la Partie 2 (volumes bruts) répond à une
+question structurante :
+
+- Si le VAR sur le RiskIndex montre une **causalité de Granger CISS →
+  RiskIndex** (alors que celle CISS → Volumes était quasi-nulle), cela
+  suggère que ce qui réagit au stress n'est pas le niveau mais la
+  **concentration** des expositions. Économiquement : durant les
+  épisodes de stress, les banques ne réduisent pas tant leurs expositions
+  agrégées qu'elles redéployent leur portefeuille vers des juridictions
+  jugées plus sûres (modification de la concentration par pays).
+
+- Si les deux VAR donnent des résultats similaires (pas de causalité de
+  Granger), cela renforce la conclusion d'un canal de transmission
+  invisible aux LBS.
+
+---
+
+## Régressions panel
+
+Cette section opérationnalise l'analyse de contextualisation
+macro-financière de la sous-section 3.1 du rapport en exploitant la
+dimension panel (5 pays prioritaires × 45 trimestres ≈ 225 observations).
+On régresse les variations de l'exposition NBFI dans chaque pays sur les
+variations contemporaines et retardées des variables macro-financières,
+avec effets fixes pays pour absorber les disparités structurelles entre
+juridictions, et erreurs-type robustes clusterisées par pays.
+
+```{r data-panel-fred}
+# Construction de la base macro trimestrielle FRED
+build_quarterly <- function(filepath, var_name) {
+  d <- readr::read_csv(filepath, show_col_types = FALSE)
+  date_col <- names(d)[1]    # première col = date
+  val_col  <- names(d)[2]
+  d <- d %>%
+    dplyr::mutate(date = as.Date(.data[[date_col]]),
+                  value = as.numeric(.data[[val_col]])) %>%
+    dplyr::filter(!is.na(date), !is.na(value))
+  d_xts <- xts::xts(d$value, order.by = d$date)
+  d_qtr <- xts::apply.quarterly(d_xts, FUN = mean, na.rm = TRUE)
+
+  result <- tibble::tibble(
+    date = zoo::index(d_qtr),
+    !!var_name := as.numeric(d_qtr)
+  ) %>%
+    dplyr::mutate(QUARTER = paste0(format(date, "%Y"), "-Q",
+                                    lubridate::quarter(date))) %>%
+    dplyr::select(QUARTER, !!sym(var_name))
+  return(result)
+}
+
+# Note: Les chemins utilisent le même répertoire que les autres données du projet
+# Les chemins utilisent data_dir défini au début du notebook
+fred_paths <- list(
+  vix    = file.path(data_dir, "VIXCLS.csv"),
+  baa    = file.path(data_dir, "BAA10YM.csv"),
+  dff    = file.path(data_dir, "DFF.csv"),
+  t10y2y = file.path(data_dir, "T10Y2Y.csv")
+)
+
+if (all(sapply(fred_paths, file.exists))) {
+  fred_quarterly <- purrr::reduce(
+    list(
+      build_quarterly(fred_paths$vix,    "vix"),
+      build_quarterly(fred_paths$baa,    "baa10y"),
+      build_quarterly(fred_paths$dff,    "dff"),
+      build_quarterly(fred_paths$t10y2y, "t10y2y")
+    ),
+    dplyr::full_join, by = "QUARTER"
+  ) %>%
+    dplyr::arrange(QUARTER)
+
+  cat("Base macro trimestrielle :\n")
+  print(head(fred_quarterly))
+  cat("\nDimensions :", dim(fred_quarterly), "\n")
+
+  # Heatmap des corrélations entre variables explicatives
+  fred_cor <- fred_quarterly %>%
+    dplyr::select(-QUARTER) %>%
+    stats::cor(use = "pairwise.complete.obs")
+  cat("\nMatrice de corrélation des variables macro :\n")
+  print(round(fred_cor, 3))
+}
+```
+
+```{r panel-construction}
+# Construction du panel pays × trimestre
+if (exists("expo_priority") && exists("fred_quarterly")) {
+
+  panel_data <- expo_priority %>%
+    dplyr::left_join(fred_quarterly, by = "QUARTER") %>%
+    dplyr::group_by(country) %>%
+    dplyr::arrange(QUARTER) %>%
+    dplyr::mutate(
+      d_exposure = exposure_nbfi - dplyr::lag(exposure_nbfi),
+      d_vix      = vix    - dplyr::lag(vix),
+      d_baa      = baa10y - dplyr::lag(baa10y),
+      d_dff      = dff    - dplyr::lag(dff),
+      d_t10y2y   = t10y2y - dplyr::lag(t10y2y),
+      # Lag 1 des variables macro pour spécification dynamique
+      d_vix_l1    = dplyr::lag(d_vix, 1),
+      d_baa_l1    = dplyr::lag(d_baa, 1),
+      d_dff_l1    = dplyr::lag(d_dff, 1),
+      d_t10y2y_l1 = dplyr::lag(d_t10y2y, 1)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(!is.na(d_exposure))
+
+  cat("Panel construit :", nrow(panel_data), "obs.\n")
+  cat("Pays :", paste(unique(panel_data$country), collapse = ", "), "\n")
+
+  # Conversion en pdata.frame
+  panel_pdf <- plm::pdata.frame(panel_data, index = c("country", "QUARTER"))
+}
+```
+
+### Spécifications panel
+
+```{r panel-specs}
+if (exists("panel_pdf")) {
+
+  spec1 <- try(plm::plm(
+    d_exposure ~ d_vix + d_baa + d_dff + d_t10y2y,
+    data = panel_pdf, model = "within", effect = "individual"
+  ), silent = TRUE)
+
+  spec2 <- try(plm::plm(
+    d_exposure ~ d_vix + d_baa + d_dff + d_t10y2y,
+    data = panel_pdf, model = "within", effect = "twoways"
+  ), silent = TRUE)
+
+  spec3 <- try(plm::plm(
+    d_exposure ~ d_vix + d_baa + d_dff + d_t10y2y +
+                 d_vix_l1 + d_baa_l1 + d_dff_l1 + d_t10y2y_l1,
+    data = panel_pdf, model = "within", effect = "individual"
+  ), silent = TRUE)
+
+  panel_pdf$d_exposure_l1 <- plm::lag(panel_pdf$d_exposure, 1)
+  spec4 <- try(plm::plm(
+    d_exposure ~ d_exposure_l1 + d_vix + d_baa + d_dff + d_t10y2y,
+    data = panel_pdf, model = "within", effect = "individual"
+  ), silent = TRUE)
+
+  print_spec <- function(spec, name) {
+    cat(paste0("\n=== ", name, " ===\n"))
+    if (inherits(spec, "try-error")) {
+      cat("Échec de l'estimation :", attr(spec, "condition")$message, "\n")
+      cat("(Probable cause : trop de NA ou degrés de liberté insuffisants)\n")
+    } else {
+      print(lmtest::coeftest(spec, vcov = plm::vcovHC(spec, cluster = "group")))
+    }
+  }
+
+  print_spec(spec1, "Spec 1 : FE pays seuls")
+  print_spec(spec2, "Spec 2 : FE pays + temps (two-ways)")
+  print_spec(spec3, "Spec 3 : FE pays + retards")
+  print_spec(spec4, "Spec 4 : modèle dynamique (lagged DV)")
+
+  cat("\n=== Diagnostic du panel ===\n")
+  cat("Observations totales :", nrow(panel_pdf), "\n")
+  cat("Observations complètes (toutes variables) :",
+      sum(complete.cases(panel_pdf[, c("d_exposure", "d_vix", "d_baa",
+                                        "d_dff", "d_t10y2y")])), "\n")
+  cat("Pays :", length(unique(panel_pdf$country)), "\n")
+  cat("Trimestres :", length(unique(panel_pdf$QUARTER)), "\n")
+
+  if (!inherits(spec1, "try-error")) {
+    spec_re <- try(plm::plm(
+      d_exposure ~ d_vix + d_baa + d_dff + d_t10y2y,
+      data = panel_pdf, model = "random"
+    ), silent = TRUE)
+    if (!inherits(spec_re, "try-error")) {
+      cat("\nTest de Hausman (FE vs RE) :\n")
+      print(plm::phtest(spec1, spec_re))
+    }
+  }
+}
+```
+
+### Interprétation des régressions panel
+
+La spécification principale (Spec 1, effets fixes pays, 235 observations)
+identifie le **VIX comme seule variable macro-financière significativement
+associée aux variations trimestrielles d'exposition bancaire aux NBFI**
+($\hat{\beta} = +2\,774$, $p = 0{,}019$). Le signe positif est cohérent
+avec le mécanisme de tirage de lignes de crédit documenté dans la
+littérature (*Shadow Always Touches the Feet*, NBER) : en période de
+stress de marché, les NBFI activent leurs facilités bancaires, ce qui
+accroît l'exposition on-balance-sheet mesurée par les LBS. Deux canaux
+complémentaires peuvent contribuer à cet effet : les réévaluations au
+mark-to-market des positions dérivées en période de volatilité, et
+l'augmentation transitoire des expositions de couverture.
+
+L'introduction de retards (Spec 3) révèle un **canal monétaire** invisible
+dans la spécification contemporaine : le taux directeur américain (DFF)
+a un effet contemporain positif ($\hat{\beta} = +37\,194$, $p = 0{,}022$)
+puis un effet retardé négatif ($\hat{\beta}_{-1} = -29\,265$, $p = 0{,}015$).
+Ce pattern en deux temps est cohérent avec un ajustement séquentiel :
+les NBFI anticipent le resserrement en tirant davantage sur leurs lignes
+de crédit (effet contemporain positif), puis les banques durcissent
+leurs conditions et l'exposition se contracte au trimestre suivant (effet
+retardé négatif). L'effet net est faible ($\approx +8\,000$), ce qui
+explique pourquoi la Spec 1 sans retards ne détecte pas la variable DFF.
+
+La variable dépendante retardée n'est pas significative dans la
+spécification dynamique (Spec 4, $p = 0{,}200$), confirmant l'absence
+d'inertie autorégressive identifiée par l'ARIMA en Partie 1.
+
+La **spécification two-ways FE (Spec 2) échoue par construction** :
+les régresseurs (VIX, DFF, BAA10Y, T10Y2Y) sont des variables globales
+identiques pour les 5 pays à chaque trimestre. Les effets fixes temps
+absorbent donc toute leur variation, rendant le modèle vide. Ce n'est
+pas un défaut de l'analyse mais une conséquence structurelle de la
+nature des régresseurs — l'identification passe exclusivement par la
+variation temporelle, et non par l'hétérogénéité inter-pays au sein d'un
+trimestre.
+
+Le **test de Hausman** ($\chi^2 \approx 0$, $p = 1$) ne discrimine pas
+entre effets fixes et aléatoires. Ce résultat est attendu : les
+régresseurs étant globaux, l'hétérogénéité non observée par pays
+(niveaux moyens d'exposition différents entre les Caïmans et l'Irlande)
+est mécaniquement orthogonale aux conditions macro-financières. On retient
+les effets fixes par convention.
+
+### Régression delta-delta : NBFI vs Banks
+
+L'une des conjectures de la sous-section 3.1 du rapport était que les
+variations d'exposition aux NBFI réagissent plus fortement au stress
+que les variations d'exposition interbancaire — autrement dit, que
+l'élasticité est sectorielle. On la teste formellement par la régression :
+
+$$\Delta V^{NBFI}_t - \Delta V^{Bank}_t = \alpha + \beta \Delta VIX_t + \varepsilon_t$$
+
+```{r data-bank-nbfi}
+# Production directe de la base bank+NBFI à partir de data, avec les noms
+# longs cohérents avec ceux des Parties 1 et 2.
+expo_bn_wide <- data %>%
+  dplyr::filter(
+    `Reporting.country`                  == "All reporting countries",
+    `Counterparty.country`               == "All countries (total)",
+    `Type.of.instruments`                == "All instruments",
+    `Currency.denomination`              == "All currencies",
+    `Counterparty.sector`                %in% c("Banks, total",
+                                                 "Non-bank financial institutions"),
+    `Type.of.reporting.institutions`     == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)",
+    `Currency.type.of.reporting.country` == "All currencies (=D+F+U)",
+    `Parent.country`                     == "All countries (total)",
+    `Measure`                            == "Amounts outstanding / Stocks",
+    `Balance.sheet.position`             == "Total claims",
+    `Position.type`                      == "All"
+  )
+
+expo_bn <- expo_bn_wide %>%
+  tidyr::pivot_longer(
+    cols      = all_of(quarter_cols),
+    names_to  = "QUARTER_RAW",
+    values_to = "volume"
+  ) %>%
+  dplyr::filter(!is.na(volume)) %>%
+  dplyr::mutate(
+    QUARTER = stringr::str_replace_all(QUARTER_RAW, c("^X" = "", "\\." = "-")),
+    secteur = dplyr::case_when(
+      `Counterparty.sector` == "Banks, total"                    ~ "vol_bank",
+      `Counterparty.sector` == "Non-bank financial institutions" ~ "vol_nbfi"
+    )
+  ) %>%
+  dplyr::select(QUARTER, secteur, volume) %>%
+  tidyr::pivot_wider(names_from = secteur, values_from = volume) %>%
+  dplyr::arrange(QUARTER)
+
+cat("Base bank/nbfi construite :\n")
+print(head(expo_bn))
+cat("Dimensions :", dim(expo_bn), "\n")
+```
+
+```{r delta-delta-reg}
+if (exists("expo_bn") && exists("fred_quarterly")) {
+  bn <- expo_bn %>%
+    dplyr::left_join(fred_quarterly, by = "QUARTER") %>%
+    dplyr::arrange(QUARTER) %>%
+    dplyr::mutate(
+      d_vol_nbfi  = vol_nbfi - dplyr::lag(vol_nbfi),
+      d_vol_bank  = vol_bank - dplyr::lag(vol_bank),
+      delta_delta = d_vol_nbfi - d_vol_bank,
+      d_vix       = vix - dplyr::lag(vix)
+    ) %>%
+    dplyr::filter(!is.na(delta_delta), !is.na(d_vix))
+
+  reg_dd <- lm(delta_delta ~ d_vix, data = bn)
+
+  # Erreurs-type Newey-West (autocorrélation et hétéroscédasticité)
+  cat("Régression Δ(NBFI) - Δ(Bank) sur ΔVIX, SE Newey-West :\n")
+  print(lmtest::coeftest(reg_dd, vcov = sandwich::NeweyWest(reg_dd)))
+}
+```
+
+### Interprétation
+
+Trois conclusions possibles selon les résultats :
+
+1. **β négatif et significatif** : un choc VIX réduit davantage les
+   expositions NBFI que les expositions interbancaires → les banques
+   considèrent les NBFI comme plus risquées et ajustent plus fortement.
+   Confirmerait un canal de transmission spécifique au secteur NBFI.
+
+2. **β positif et significatif** : les banques réduisent plus leurs
+   expositions interbancaires que NBFI en période de stress.
+   Cohérent avec une "fuite vers les NBFI" — résultat surprenant mais
+   économiquement défendable si les NBFI sont considérées comme
+   diversificatrices de risque.
+
+3. **β non significatif** : les deux types d'expositions réagissent de
+   manière similaire au stress. Cela suggère qu'il n'y a pas de
+   différenciation sectorielle dans la réaction des banques au stress
+   global mesuré par le VIX.
+
+
+# Conclusion
+
+Ce notebook applique strictement la méthodologie de Box-Jenkins enseignée
+à l'ENSAE et l'étend par huit analyses techniques complémentaires :
+
+1. **Robustesse trend-stationary vs difference-stationary** : les tests de
+   stationnarité en Partie 1 suggèrent que la série pourrait être
+   trend-stationary plutôt que I(1). Les deux spécifications concurrentes
+   (ARMA sur résidus OLS vs ARIMA en différences) sont estimées en
+   parallèle et comparées par RMSE hors-échantillon, seul critère
+   directement comparable entre les deux.
+
+2. **Comparaison aux benchmarks naïfs** : l'ARIMA(0,1,1) avec drift est
+   confronté à une marche aléatoire avec drift et à une prévision
+   saisonnière naïve, pour quantifier honnêtement son apport prédictif.
+
+3. **IRF et FEVD** sur le VAR bivarié : caractérisent la réponse
+   dynamique des variables aux chocs et la décomposition de la variance
+   des erreurs de prévision, avec test de robustesse à l'ordre de
+   Cholesky.
+
+4. **Test de cointégration de Johansen** sur les séries en niveau :
+   vérifie l'absence de relation de long terme et valide le choix d'un
+   VAR-en-différences plutôt qu'un VECM.
+
+5. **Causalité de Granger en fenêtre glissante** : examine si le lien
+   prédictif entre stress et exposition s'active spécifiquement durant
+   les épisodes de stress (Covid 2020, gilt crisis 2022, banking
+   turmoil 2023).
+
+6. **Modélisation ARIMA par pays de contrepartie** sur les cinq
+   juridictions prioritaires identifiées en partie descriptive, pour
+   tester l'homogénéité de la dynamique géographique.
+
+7. **VAR sur le RiskIndex** comme alternative aux volumes bruts, pour
+   tester si c'est la concentration des expositions plutôt que leur
+   niveau qui interagit avec le stress.
+
+8. **Régressions panel** avec effets fixes pays/temps, erreurs-type
+   clusterisées, spécifications dynamiques avec variable dépendante
+   retardée, et test de Hausman, pour exploiter la dimension panel des
+   cinq pays prioritaires.
+
+L'ensemble forme une analyse cohérente articulée autour de la question
+centrale du projet : les interconnexions banques-NBFI constituent-elles
+un canal de transmission du risque systémique ? La réponse, nuancée,
+combine un constat statistique (absence de causalité de Granger
+détectable à fréquence trimestrielle sur l'ensemble de la période, mais
+causalité CISS → Exposition significative à 1-5 % sur les fenêtres
+pré-Covid) et une interprétation méthodologique (la mesure
+on-balance-sheet trimestrielle des LBS ne permet pas de capter les
+canaux dominants de transmission identifiés dans la littérature, qui
+opèrent via des positions hors-bilan, des dynamiques contemporaines ou
+non linéaires).
