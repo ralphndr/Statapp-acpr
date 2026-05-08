@@ -6,7 +6,6 @@ output:
   html_document: default
 ---
 
---- Import des libraries nécessaires---
 ```{r Libraries}
 library(readr)
 library(janitor)     # cleaning
@@ -75,7 +74,6 @@ compute_detailed_summary <- function(df, group_col, value_col) {
 }
 ```
 
---- Premier niveau de résumé des données + infos de base ---
 ```{r breve_description}
 data <- read_csv("/Users/ralphnader/Desktop/Github_Projects/Statapp/data/WS_LBS_D_PUB_csv_col.csv")
 ```
@@ -119,18 +117,6 @@ check_rows <- long_filtered %>%
 print(check_rows)
 ```
 
-On a la structure suivante pour la base de données:
-_______________________
-Nb de lignes               608020  
-Nb de colonnes             223   
-_______________________          
-Freq du type de colonnes:           
-  character                29    
-  logical                  2     
-  numeric                  192 
-________________________
-
---- Nettoyage des données et preprocess ---
 ```{r Valeurs manquantes}
 # valeurs manquantes par col
 missing_by_var <- data %>%
@@ -190,12 +176,6 @@ if(length(present) == 0) {
 cat("Database shape:", dim(data)[1], ",", dim(data)[2], "\n")
 ```
 
-Après avoir lancé la cellule précédente,on obtient:
-        1) Database shape: 608020 , 223 
-        2) Database shape: 608020 , 221 
-ce qui confirme la suppression des deux colonnes (comme souhaité).
-
---- Statistiques descriptives ---
 ```{r stats_descriptives}
 quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
 bsp_col <- names(data)[grepl("Balance.*sheet.*position|Balance.*position", names(data), ignore.case = TRUE)][1]
@@ -375,7 +355,6 @@ if(nrow(long_filtered) > 0) {
 }
 ```
 
---- Stats descrp : secteur de contrepartie ---
 ```{r Secteur contrepartie}
 quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
 bsp_col <- names(data)[grepl("Balance.*sheet.*position|Balance.*position", names(data), ignore.case = TRUE)][1]
@@ -550,7 +529,6 @@ summary_table <- df_sectors %>%
 print(as.data.frame(summary_table))
 ```	
 
---- Stats descrp : type d'instruments financiers---
 ```{r Instruments}
 # meme logique secteur de contrepartie avec filtre à partir de 2014
 quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]
@@ -725,7 +703,6 @@ summary_table <- df_sectors %>%
 print(as.data.frame(summary_table))
 ```
 
---- Stats descrp : monnaie d'échange ---
 ```{r monnaie_echange}
 # meme logique secteur de contrepartie avec filtre à partir de 2014
 quarter_cols <- names(data)[grepl("^\\d{4}-Q[1-4]$", names(data))]

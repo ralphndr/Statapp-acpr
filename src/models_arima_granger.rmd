@@ -1,0 +1,1652 @@
+---
+title: 'Interconnexions Banques – NBFI : Modélisation des expositions internationales'
+author: "Jean-Médérick BESSI, Yasmine BOUTCHICH, Ralph NADER, Massil ZOUAGHI"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    df_print: kable
+subtitle: Projet Stat'App – ACPR
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 5
+)
+```
+
+```{r packages}
+require(dplyr)
+require(tidyverse)
+require(knitr)
+require(kableExtra)
+require(tseries)
+require(forecast)
+require(fUnitRoots)   # adfTest with explicit specification choice
+require(lmtest)       # coeftest
+require(vars)
+require(xts)
+require(stringr)
+require(zoo)
+require(urca)         # Johansen cointegration test
+require(plm)          # panel regressions (fixed effects, clustered SE)
+require(sandwich)     # robust standard errors
+require(broom)        # tidy() for nice output tables
+require(gridExtra)
+require(forecast)
+```
+
+```{r import}
+
+data_dir <- "/Users/ralphnader/Desktop/Github_Projects/Statapp/data"
+data <- read.csv(file.path(data_dir, "WS_LBS_D_PUB_csv_col.csv"))
+```
+
+```{r missing}
+cols_to_drop <- c("TIME_FORMAT", "Time.Format")
+present <- cols_to_drop[cols_to_drop %in% names(data)]
+if (length(present) > 0) {
+  # data  <- data  %>% dplyr::select(-dplyr::any_of(present))
+  data <- data %>% dplyr::select(-dplyr::any_of(present))
+}
+cat("Dimensions après nettoyage :", dim(data)[1], "lignes ×", dim(data)[2], "colonnes\n")
+```
+
+```{r pivot long}
+quarter_cols <- grep("^X\\d{4}\\.Q[1-4]$", names(data), value = TRUE)
+if (length(quarter_cols) == 0) stop("Aucune colonne trimestrielle trouvée.")
+
+data <- data %>%
+  filter(`Counterparty.sector` %in% c("Banks, total",
+                                       "Non-bank financial institutions"))
+
+long <- data %>%
+  pivot_longer(
+    cols      = all_of(quarter_cols),
+    names_to  = "period",
+    values_to = "amount"
+  ) %>%
+  mutate(amount = as.numeric(amount))
+```
+
+```{r filtrenbfi}
+# Filtre cohérent avec le filtre de la base mère (anti-double comptage)
+long_claims <- long %>%
+  filter(
+    `Reporting.country`                  == "All reporting countries",
+    `Counterparty.country`               == "All countries (total)",
+    `Type.of.instruments`                == "All instruments",
+    `Currency.denomination`              == "All currencies",
+    `Counterparty.sector`                == "Non-bank financial institutions",
+    `Type.of.reporting.institutions`     == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)",
+    `Currency.type.of.reporting.country` == "All currencies (=D+F+U)",
+    `Parent.country`                     == "All countries (total)",
+    `Measure`                            == "Amounts outstanding / Stocks",
+    Balance.sheet.position               == "Total claims",
+    Position.type                        == "All"
+  )
+
+table_tc <- long_claims %>%
+  filter(!is.na(amount)) %>%
+  group_by(period) %>%
+  summarise(total_amount = sum(amount, na.rm = TRUE), .groups = "drop") %>%
+  arrange(period) %>%
+  mutate(
+    year    = as.numeric(str_extract(period, "\\d{4}")),
+    quarter = as.numeric(str_extract(period, "(?<=Q)\\d"))
+  )
+
+# vérification que la série commence bien en 2013-Q4 avant de hardcoder ts
+stopifnot(table_tc$year[1] == 2013, table_tc$quarter[1] == 4)
+
+x <- ts(table_tc$total_amount,
+        start     = c(table_tc$year[1], table_tc$quarter[1]),
+        frequency = 4)
+cat("Longueur de la série :", length(x), "trimestres\n")
+```
+
+```{r utils bj}
+# Test portmanteau (Ljung-Box) sur k retards, avec correction de degrés de liberté
+Qtests <- function(series, k, fitdf = 0) {
+  pvals <- apply(matrix(1:k), 1, FUN = function(l) {
+    pval <- if (l <= fitdf) NA
+            else Box.test(series, lag = l, type = "Ljung-Box", fitdf = fitdf)$p.value
+    return(c("lag" = l, "pval" = pval))
+  })
+  return(t(pvals))
+}
+
+# ADF avec choix automatique du nombre de retards : on incrémente p tant que les
+# résidus du test ADF présentent une autocorrélation détectable (Ljung-Box).
+# Cf. Lecture 4 p. 22-25 : l'ADF suppose un bruit blanc, il faut donc enrichir
+# la spécification jusqu'à ce que cette hypothèse soit vérifiée.
+adfTest_valid <- function(series, kmax, adftype) {
+  k <- 0
+  noautocorr <- 0
+  while (noautocorr == 0 && k <= kmax) {
+    cat(paste0("ADF avec ", k, " retards : résidus non corrélés ? "))
+    adf <- suppressWarnings(adfTest(series, lags = k, type = adftype))
+    pvals <- Qtests(adf@test$lm$residuals, 24,
+                    fitdf = length(adf@test$lm$coefficients))[, 2]
+    if (sum(pvals < 0.05, na.rm = TRUE) == 0) {
+      noautocorr <- 1; cat("OUI\n")
+    } else cat("non\n")
+    k <- k + 1
+  }
+  return(adf)
+}
+
+# test de significativité des coefficients (loi normale asymptotique)
+signif <- function(estim) {
+  coef <- estim$coef
+  se   <- sqrt(diag(estim$var.coef))
+  t    <- coef / se
+  pval <- (1 - pnorm(abs(t))) * 2
+  return(rbind(coef, se, pval))
+}
+
+# diag complet d'un ARMA : ajustement + validité
+arimafit <- function(estim) {
+  adjust <- round(signif(estim), 3)
+  pvals  <- Qtests(estim$residuals, 24, fitdf = length(estim$coef))
+  pvals  <- matrix(apply(matrix(1:24, nrow = 6), 2,
+                         function(c) round(pvals[c, ], 3)), nrow = 6)
+  colnames(pvals) <- rep(c("lag", "pval"), 4)
+  cat("Tests de nullité des coefficients :\n"); print(adjust)
+  cat("\nTests d'absence d'autocorrélation des résidus :\n"); print(pvals)
+}
+```
+
+
+```{r plot serie brute}
+df_x <- data.frame(date = as.Date(zoo::as.yearqtr(time(x))),
+                   value = as.numeric(x))
+ggplot(df_x, aes(x = date, y = value)) +
+  geom_line(color = "#003399", linewidth = 1.2) +
+  scale_y_continuous(labels = scales::label_number(big.mark = " ")) +
+  labs(x = "Trimestre", y = "Montant total (en millions de dollars)",
+       caption = "Source : BRI, Locational Banking Statistics") +
+  theme_minimal()+
+  theme(
+    # agrandir les titres des axes (x et y)
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    
+    # agrandir aussi le texte des graduations (les dates et les montants)
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    
+    # agrandir le titre principal pour qu'il reste proportionné
+    plot.title = element_text(size = 16, face = "bold")
+  )
+
+ggsave("plot_serie_brute.pdf", width = 12, height = 8, dpi = 300)
+```
+
+```{r trend test x}
+trend_x <- 1:length(x)
+lm_x <- lm(as.numeric(x) ~ trend_x)
+summary(lm_x)$coefficients
+```
+
+```{r adf x}
+adf_x <- adfTest_valid(x, kmax = 12, adftype = "ct")
+adf_x
+```
+
+```{r adf x residuals}
+# vérification : les résidus du test ADF retenu sont bien un bruit blanc
+Qtests(adf_x@test$lm$residuals, 24,
+       fitdf = length(adf_x@test$lm$coefficients))
+```
+
+```{r pp kpss x}
+pp.test(x)
+kpss.test(x, null = "Trend")
+```
+
+```{r tsresiduals test}
+
+y_hat <- residuals(lm_x)
+# verif visuelle
+pdf("plot_residus_ols.pdf", width = 12, height = 8)
+plot(time(x), y_hat, type = "l", col = "#003399", lwd = 2,
+     main = "Résidus de la régression OLS x ~ t",
+     xlab = "Temps", ylab = "Résidu")
+abline(h = 0, lty = 2, col = "#8C9DB5")
+dev.off()
+# affichage dans le notebook
+plot(time(x), y_hat, type = "l", col = "#003399", lwd = 2,
+     main = "Résidus de la régression OLS x ~ t",
+     xlab = "Temps", ylab = "Résidu")
+abline(h = 0, lty = 2, col = "#8C9DB5")
+
+# ADF sur les résidus (spec "c" car on a déjà retiré la tendance)
+cat("\nADF sur les résidus de la régression linéaire :\n")
+adf_resid <- adfTest_valid(y_hat, kmax = 12, adftype = "c")
+adf_resid
+
+# KPSS Level sur les résidus
+cat("\nKPSS Level sur les résidus :\n")
+kpss.test(y_hat, null = "Level")
+
+# Test de Ljung-Box sur les résidus pour détecter de l'autocorrélation
+# résiduelle (signe d'une mauvaise spec ou de structure ARMA)
+cat("\nLjung-Box sur les résidus (lags 1, 4, 8, 12) :\n")
+sapply(c(1, 4, 8, 12), function(l) {
+  list(lag = l, p = Box.test(y_hat, lag = l, type = "Ljung-Box")$p.value)
+})
+```
+
+```{r diff x}
+dx <- diff(x)
+df_dx <- data.frame(date = as.Date(zoo::as.yearqtr(time(dx))),
+                    value = as.numeric(dx))
+
+ggplot(df_dx, aes(x = date, y = value)) +
+  geom_line(color = "#003399", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#8C9DB5") +
+  labs(x = "Trimestre", 
+       y = "Montant (en millions de dollars)") +
+  theme_minimal() +
+  theme(
+    # Agrandissement des titres des axes (X et Y)
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    
+    # Agrandissement des graduations (dates en bas, valeurs à gauche)
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    
+    # Agrandissement du titre principal
+    plot.title = element_text(size = 16, face = "bold")
+  )
+
+# L'export en haute définition
+ggsave("plot_serie_diff.pdf", width = 12, height = 8, dpi = 300)
+```
+
+```{r trend test dx}
+# test formel d'une tendance résiduelle dans dx
+trend_dx <- 1:length(dx)
+lm_dx <- lm(as.numeric(dx) ~ trend_dx)
+summary(lm_dx)$coefficients
+
+# Test de la moyenne (constante) : l'inclusion d'un drift dans l'ARIMA
+# se justifie par un mean(dx) significativement non nul
+t.test(as.numeric(dx))
+```
+
+```{r adf dx}
+adf_dx <- adfTest_valid(dx, kmax = 12, adftype = "c")
+adf_dx
+```
+
+```{r pp kpss dx}
+pp.test(dx)
+kpss.test(dx, null = "Level")
+```
+
+```{r acf pacf}
+pdf("plot_acf_pacf_dx.pdf", width = 12, height = 6)
+par(mfrow = c(1, 2))
+
+# ACF
+acf(as.numeric(dx), lag.max = 20, main = "ACF (série différenciée)", 
+    col = "#003399", lwd = 2, xaxt = "n") # xaxt = "n" désactive l'axe X par défaut
+# On ajoute notre axe X personnalisé (1 = axe du bas), allant de 0 à 20 par pas de 5
+axis(1, at = seq(0, 20, by = 5)) 
+
+#PACF
+pacf(as.numeric(dx), lag.max = 20, main = "PACF (série différenciée)", 
+     col = "#003399", lwd = 2, xaxt = "n")
+# ajoute le même axe X personnalisé
+axis(1, at = seq(0, 20, by = 5))
+
+par(mfrow = c(1, 1))
+```
+
+```{r seasonal check}
+# vérification rapide : pas de différenciation saisonnière nécessaire
+forecast::nsdiffs(x)
+```
+
+```{r pmax-qmax}
+pmax <- 3
+qmax <- 1
+```
+
+```{r estimation validation}
+# Pour les ARIMA(p,1,q) avec constante (drift), on travaille directement sur x
+# en passant order = c(p, 1, q) et include.mean = TRUE n'est pas autorisé pour d>0
+# dans stats::arima ; on utilise donc forecast::Arima avec include.drift = TRUE
+# pour incorporer le drift mis en évidence par le t-test sur dx.
+#
+# Un modèle "bien ajusté" exige la significativité du coefficient AR le plus
+# élevé (si p > 0) ET du coefficient MA le plus élevé (si q > 0).
+
+modelchoice <- function(p, q, data = x) {
+  estim <- try(forecast::Arima(data, order = c(p, 1, q),
+                               include.drift = TRUE,
+                               method = "ML"), silent = TRUE)
+  if (inherits(estim, "try-error")) {
+    return(c(p = p, q = q, arsignif = NA, masignif = NA,
+             resnocorr = NA, ok = NA))
+  }
+  s <- signif(estim)
+  # Indices : les coefficients AR sont nommés ar1..arp, MA ma1..maq, drift
+  ar_idx <- if (p > 0) which(grepl("^ar", colnames(s)))[p] else NA
+  ma_idx <- if (q > 0) which(grepl("^ma", colnames(s)))[q] else NA
+  arsignif <- if (p == 0) NA else s["pval", ar_idx] <= 0.05
+  masignif <- if (q == 0) NA else s["pval", ma_idx] <= 0.05
+  pvals_res <- Qtests(estim$residuals, 24,
+                      fitdf = length(estim$coef))[, 2]
+  resnocorr <- sum(pvals_res < 0.05, na.rm = TRUE) == 0
+  checks <- c(arsignif, masignif, resnocorr)
+  ok <- as.numeric(sum(checks, na.rm = TRUE) == (3 - sum(is.na(checks))))
+  return(c(p = p, q = q, arsignif = arsignif, masignif = masignif,
+           resnocorr = resnocorr, ok = ok))
+}
+
+armamodelchoice <- function(pmax, qmax) {
+  pqs <- expand.grid(0:pmax, 0:qmax)
+  t(apply(matrix(1:dim(pqs)[1]), 1, function(row) {
+    p <- pqs[row, 1]; q <- pqs[row, 2]
+    cat(paste0("ARIMA(", p, ",1,", q, ") avec drift\n"))
+    modelchoice(p, q)
+  }))
+}
+
+armamodels <- armamodelchoice(pmax, qmax)
+print(armamodels)
+```
+
+```{r selection valides}
+selec <- armamodels[
+  armamodels[, "ok"] == 1 & !is.na(armamodels[, "ok"]), , drop = FALSE
+]
+selec
+```
+
+```{r racines}
+# Vérification de la stationnarité de la composante AR : toutes les racines du
+# polynôme autorégressif doivent être hors du disque unité. C'est la condition
+# de causalité (Lecture 1 p. 29-31).
+verifier_racines <- function(p, q, data = x) {
+  m <- forecast::Arima(data, order = c(p, 1, q),
+                       include.drift = TRUE, method = "ML")
+  if (p == 0) return(TRUE)
+  ar_coef <- m$coef[grepl("^ar", names(m$coef))]
+  racines <- polyroot(c(1, -ar_coef))
+  modules <- Mod(racines)
+  cat(sprintf("ARIMA(%d,1,%d) avec drift : modules des racines AR = %s\n",
+              p, q, paste(round(modules, 3), collapse = ", ")))
+  all(modules > 1)
+}
+
+if (nrow(selec) > 0) {
+  for (i in seq_len(nrow(selec))) {
+    verifier_racines(selec[i, "p"], selec[i, "q"])
+  }
+}
+```
+
+```{r aic bic valides}
+if (nrow(selec) > 0) {
+  pqs <- apply(selec, 1, function(row) {
+    list(p = as.numeric(row["p"]), q = as.numeric(row["q"]))
+  })
+  names(pqs) <- paste0("ARIMA(", selec[, "p"], ",1,", selec[, "q"], ")_d")
+
+  models <- lapply(pqs, function(pq) {
+    forecast::Arima(x, order = c(pq$p, 1, pq$q),
+                    include.drift = TRUE, method = "ML")
+  })
+
+  ic_table <- vapply(models, FUN.VALUE = numeric(2),
+                     function(m) c(AIC = AIC(m), BIC = BIC(m)))
+  print(ic_table)
+}
+```
+
+```{r ic-resume}
+if (nrow(selec) > 0) {
+  cat("Modèle minimisant l'AIC :", names(which.min(ic_table["AIC", ])), "\n")
+  cat("Modèle minimisant le BIC :", names(which.min(ic_table["BIC", ])), "\n")
+}
+```
+
+```{r holdout-rmse}
+h <- 8
+n <- length(x)
+x_train <- ts(x[1:(n - h)], start = start(x), frequency = 4)
+x_test  <- x[(n - h + 1):n]
+
+if (nrow(selec) > 0) {
+  rmse_holdout <- vapply(pqs, FUN.VALUE = numeric(1), function(pq) {
+    m_train <- forecast::Arima(x_train, order = c(pq$p, 1, pq$q),
+                               include.drift = TRUE, method = "ML")
+    fc <- forecast(m_train, h = h)$mean
+    sqrt(mean((as.numeric(fc) - as.numeric(x_test))^2)) / sd(x)
+  })
+  print(round(rmse_holdout, 4))
+  cat("\nMeilleure prévision hors-échantillon :",
+      names(which.min(rmse_holdout)), "\n")
+}
+```
+
+```{r choix final}
+# Choix final : le modèle qui passe les 4 filtres
+# (bien ajusté, valide, racines stables, meilleur sur RMSE OU IC selon le cas)
+final_name <- if (nrow(selec) > 0) names(which.min(rmse_holdout)) else NA
+cat("Modèle final retenu :", final_name, "\n")
+final_model <- if (nrow(selec) > 0) models[[final_name]] else NULL
+if (!is.null(final_model)) {
+  summary(final_model)
+  coeftest(final_model)
+}
+```
+
+```{r diagnostic final bis}
+#if (!is.null(final_model)) {
+#  pdf("plot_diagnostic_residus_final.pdf", width = 12, height = 8)
+#  checkresiduals(final_model)
+#  dev.off()
+#  checkresiduals(final_model)
+  # Test de Jarque-Bera sur les résidus pour la validité des intervalles de prévision
+#  jarque.bera.test(residuals(final_model))
+```
+
+```{r diagnostic final}
+if (!is.null(final_model)) {
+  
+  res <- residuals(final_model)
+  
+  # 1. Série temp
+  # On ajoute ta couleur bleue claire et la ligne zéro en bleu foncé
+  p1 <- autoplot(res) +
+    geom_line(color = "#1E90FF", linewidth = 0.8) +
+    geom_hline(yintercept = 0, color = "#003399", linetype = "dashed", alpha = 0.7) +
+    labs(title = "Résidus du modèle final", 
+         x = "Trimestre", 
+         y = "Erreurs (Résidus)") +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold"))
+  
+  # ACF
+  # Elle calculera les bons retards exactement comme checkresiduals
+  p2 <- ggAcf(res) +
+    labs(title = "Autocorrélation des résidus (ACF)",
+         y = "ACF") +
+    theme_minimal()
+  
+  p2$layers[[1]]$aes_params$colour <- "#1E90FF" 
+  p2$layers[[2]]$aes_params$colour <- "#003399"
+  
+  # Histogramme + courbe Normale
+  p3 <- gghistogram(res, add.normal = TRUE, add.kde = FALSE) +
+    labs(title = "Distribution des résidus", 
+         x = "Valeur des résidus", 
+         y = "Densité") +
+    theme_minimal()
+  
+  p3$layers[[1]]$aes_params$fill <- "#1E90FF"   
+  p3$layers[[1]]$aes_params$colour <- "white"   
+  p3$layers[[2]]$aes_params$colour <- "#003399" 
+  p3$layers[[2]]$aes_params$linewidth <- 1.2
+  
+  # assemblage + sauvegarde
+  pdf("plot_diagnostic_residus_final.pdf", width = 12, height = 8)
+  grid.arrange(p1, p2, p3, layout_matrix = rbind(c(1,1), c(2,3)))
+  dev.off()
+  
+  # affichage direct 
+  grid.arrange(p1, p2, p3, layout_matrix = rbind(c(1,1), c(2,3)))
+  
+  # tests statistiques
+  checkresiduals(final_model, plot = FALSE)
+  jarque.bera.test(na.omit(res)) # na.omit sécurise le test
+}
+```
+
+```{r prevision finale}
+if (!is.null(final_model)) {
+  prev <- forecast(final_model, h = 12)
+
+  # historique
+  hist_df <- tibble::tibble(
+    QUARTER = zoo::as.yearqtr(time(prev$x)),
+    value   = as.numeric(prev$x)
+  )
+
+  # prévisions brutes
+  fc_raw <- tibble::tibble(
+    QUARTER  = zoo::as.yearqtr(time(prev$mean)),
+    forecast = as.numeric(prev$mean),
+    lower_80 = as.numeric(prev$lower[, 1]),
+    upper_80 = as.numeric(prev$upper[, 1]),
+    lower_95 = as.numeric(prev$lower[, 2]),
+    upper_95 = as.numeric(prev$upper[, 2])
+  )
+
+  # On rattache le dernier point historique au début de la prévision pour
+  # éviter la discontinuité visuelle entre la courbe d'historique et la
+  # courbe de prévision (les deux geom_line sont sinon disjoints).
+  last_hist <- hist_df %>%
+    dplyr::slice_tail(n = 1) %>%
+    dplyr::transmute(
+      QUARTER  = QUARTER,
+      forecast = value,
+      lower_80 = value, upper_80 = value,
+      lower_95 = value, upper_95 = value
+    )
+
+  fc_df <- dplyr::bind_rows(last_hist, fc_raw)
+
+  ggplot() +
+    geom_ribbon(data = fc_df,
+                aes(x = QUARTER, ymin = lower_95, ymax = upper_95),
+                fill = "#B3D1FF", alpha = 0.45) +
+    geom_ribbon(data = fc_df,
+                aes(x = QUARTER, ymin = lower_80, ymax = upper_80),
+                fill = "#8C9DB5", alpha = 0.35) +
+    geom_line(data = hist_df,
+              aes(x = QUARTER, y = value),
+              color = "#003399", linewidth = 1.2) +
+    geom_line(data = fc_df,
+              aes(x = QUARTER, y = forecast),
+              color = "#1E90FF", linewidth = 1.1) +
+    geom_vline(xintercept = max(hist_df$QUARTER),
+               linetype = "dashed", color = "#8C9DB5") +
+    zoo::scale_x_yearqtr(format = "%Y%q") +
+    scale_y_continuous(labels = scales::label_number(accuracy = 1)) +
+    labs(x = "Trimestre", y = "Montant (en millions de dollars)") +
+    theme_minimal(base_size = 12)+
+    theme(
+      # --- AGRANDISSEMENT DES TEXTES ---
+      axis.title.x = element_text(size = 14, face = "bold"),
+      axis.title.y = element_text(size = 14, face = "bold"),
+      axis.text.x  = element_text(size = 12),
+      axis.text.y  = element_text(size = 12)
+    )
+  ggsave("plot_prevision_finale.pdf", width = 12, height = 8, dpi = 300)
+}
+```
+
+```{r filtre europe}
+pays_europeens <- c(
+  "Austria", "Belgium", "Cyprus", "Denmark", "Finland", "France", "Germany",
+  "Greece", "Guernsey", "Ireland", "Isle of Man", "Italy", "Jersey",
+  "Luxembourg", "Netherlands", "Norway", "Portugal", "Russia", "Spain",
+  "Sweden", "Switzerland", "Türkiye", "United Kingdom"
+)
+
+long_claims_eu <- long %>%
+  filter(
+    `Reporting.country`                  %in% pays_europeens,
+    `Counterparty.country`               == "All countries (total)",
+    `Type.of.instruments`                == "All instruments",
+    `Currency.denomination`              == "All currencies",
+    `Counterparty.sector`                == "Non-bank financial institutions",
+    `Type.of.reporting.institutions`     == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)",
+    `Currency.type.of.reporting.country` == "All currencies (=D+F+U)",
+    `Parent.country`                     == "All countries (total)",
+    `Measure`                            == "Amounts outstanding / Stocks",
+    Balance.sheet.position               == "Total claims",
+    Position.type                        == "All"
+  )
+
+table_tc_eu <- long_claims_eu %>%
+  filter(!is.na(amount)) %>%
+  group_by(period) %>%
+  summarise(total_amount = sum(amount, na.rm = TRUE), .groups = "drop") %>%
+  arrange(period) %>%
+  mutate(
+    year    = as.numeric(str_extract(period, "\\d{4}")),
+    quarter = as.numeric(str_extract(period, "(?<=Q)\\d"))
+  )
+
+stopifnot(table_tc_eu$year[1] == 2013, table_tc_eu$quarter[1] == 4)
+
+x_eu <- ts(table_tc_eu$total_amount,
+           start     = c(table_tc_eu$year[1], table_tc_eu$quarter[1]),
+           frequency = 4)
+```
+
+```{r stationnarite eu}
+trend_x_eu <- 1:length(x_eu)
+lm_x_eu <- lm(as.numeric(x_eu) ~ trend_x_eu)
+summary(lm_x_eu)$coefficients
+```
+
+```{r adf x eu}
+# Si tendance significative -> "ct", sinon -> "c"
+adftype_eu <- if (summary(lm_x_eu)$coefficients[2, 4] < 0.05) "ct" else "c"
+cat("Spécification ADF retenue pour x_eu :", adftype_eu, "\n")
+adf_x_eu <- adfTest_valid(x_eu, kmax = 12, adftype = adftype_eu)
+adf_x_eu
+pp.test(x_eu)
+kpss.test(x_eu, null = if (adftype_eu == "ct") "Trend" else "Level")
+```
+
+```{r diff x eu}
+dx_eu <- diff(x_eu)
+trend_dx_eu <- 1:length(dx_eu)
+lm_dx_eu <- lm(as.numeric(dx_eu) ~ trend_dx_eu)
+summary(lm_dx_eu)$coefficients
+
+adftype_dx_eu <- if (summary(lm_dx_eu)$coefficients[2, 4] < 0.05) "ct" else "c"
+adf_dx_eu <- adfTest_valid(dx_eu, kmax = 12, adftype = adftype_dx_eu)
+adf_dx_eu
+pp.test(dx_eu)
+kpss.test(dx_eu, null = "Level")
+```
+
+`dx_eu` est stationnaire et sera utilisée dans le système VAR.
+
+```{r import ciss}
+data_ciss <- read.csv(file.path(data_dir, "CISS.csv"))
+data_ciss$Date <- as.Date(data_ciss$DATE)
+
+ciss_xts <- xts(
+  data_ciss$CISS...Composite.Indicator.of.Systemic.Stress..CISS.D.U2.Z0Z.4F.EC.SS_CI.IDX.,
+  order.by = data_ciss$Date
+)
+ciss_quarterly_xts <- apply.quarterly(ciss_xts, FUN = mean)
+
+# Conversion robuste vers ts : on extrait l'année et le trimestre du PREMIER
+# point via as.yearqtr (apply.quarterly horodate à la fin du trimestre, donc
+# il faut passer par yearqtr pour ne pas se tromper de trimestre)
+ciss_first <- zoo::as.yearqtr(index(ciss_quarterly_xts)[1])
+ciss_start <- c(as.integer(format(ciss_first, "%Y")),
+                as.integer(format(ciss_first, "%q")))
+cat("CISS commence en :", paste(ciss_start, collapse = "-Q"), "\n")
+
+ciss_ts <- ts(as.numeric(ciss_quarterly_xts),
+              start = ciss_start, frequency = 4)
+
+# Stationnarité du CISS
+trend_ciss <- 1:length(ciss_ts)
+lm_ciss <- lm(as.numeric(ciss_ts) ~ trend_ciss)
+adftype_ciss <- if (summary(lm_ciss)$coefficients[2, 4] < 0.05) "ct" else "c"
+adf_ciss <- adfTest_valid(ciss_ts, kmax = 12, adftype = adftype_ciss)
+adf_ciss
+kpss.test(ciss_ts, null = if (adftype_ciss == "ct") "Trend" else "Level")
+```
+
+```{r diff ciss}
+dciss <- diff(ciss_ts)
+adf_dciss <- adfTest_valid(dciss, kmax = 12, adftype = "c")
+adf_dciss
+kpss.test(dciss, null = "Level")
+```
+
+```{r alignement eu}
+# Plages effectives de chaque série
+range_dx_eu  <- c(start(dx_eu),  end(dx_eu))
+range_dciss  <- c(start(dciss),  end(dciss))
+cat("Plage de dx_eu  :", paste(range_dx_eu[1:2], collapse = "-"),
+    "à", paste(range_dx_eu[3:4], collapse = "-"), "\n")
+cat("Plage de dciss  :", paste(range_dciss[1:2], collapse = "-"),
+    "à", paste(range_dciss[3:4], collapse = "-"), "\n")
+
+# Conversion en yearqtr pour comparer proprement les bornes
+yq <- function(yr_q) zoo::as.yearqtr(yr_q[1] + (yr_q[2] - 1) / 4)
+
+start_common <- max(yq(start(dx_eu)),  yq(start(dciss)))
+end_common   <- min(yq(end(dx_eu)),    yq(end(dciss)))
+
+# Reconversion en couple (année, trimestre)
+to_tsstart <- function(yqv) {
+  yr <- as.integer(format(yqv, "%Y"))
+  qt <- as.integer(format(yqv, "%q"))
+  c(yr, qt)
+}
+common_start <- to_tsstart(start_common)
+common_end   <- to_tsstart(end_common)
+cat("Fenêtre commune retenue :",
+    paste(common_start, collapse = "-"), "à",
+    paste(common_end,   collapse = "-"), "\n")
+
+dx_aligne_eu <- window(dx_eu,  start = common_start, end = common_end)
+dciss_aligne <- window(dciss, start = common_start, end = common_end)
+
+# Maintenant les longueurs ET les dates doivent matcher exactement
+stopifnot(length(dx_aligne_eu) == length(dciss_aligne))
+stopifnot(all.equal(as.numeric(time(dx_aligne_eu)),
+                    as.numeric(time(dciss_aligne))))
+cat("Longueur du système bivarié :", length(dx_aligne_eu), "trimestres\n")
+```
+
+```{r var select}
+systeme_bivarie <- cbind(dx_aligne_eu, dciss_aligne)
+colnames(systeme_bivarie) <- c("Exposition", "DCISS")
+
+VARselect(systeme_bivarie, lag.max = 8, type = "const")
+```
+
+```{r var estimation}
+# On retient le retard plébiscité par la majorité des critères
+modele_var <- VAR(systeme_bivarie, p = 1, type = "const")
+summary(modele_var)
+```
+
+```{r var diagnostic}
+# Absence d'autocorrélation des résidus
+serial.test(modele_var, lags.pt = 10, type = "PT.asymptotic")
+# Stabilité du VAR : toutes les racines doivent être à l'intérieur du cercle unité
+roots(modele_var)
+# Normalité des résidus (utile pour les IC des prévisions et IRF)
+normality.test(modele_var)
+```
+
+```{r granger ciss}
+causality(modele_var, cause = "DCISS")$Granger
+causality(modele_var, cause = "Exposition")$Granger
+```
+
+```{r import vix}
+data_vix <- read.csv(file.path(data_dir, "VIXCLS.csv"))
+data_vix$Date <- as.Date(data_vix$observation_date)
+vix_xts <- xts(data_vix$VIXCLS, order.by = data_vix$Date)
+vix_quarterly_xts <- apply.quarterly(vix_xts, FUN = mean, na.rm = TRUE)
+
+vix_first <- zoo::as.yearqtr(index(vix_quarterly_xts)[1])
+vix_start <- c(as.integer(format(vix_first, "%Y")),
+               as.integer(format(vix_first, "%q")))
+cat("VIX commence en :", paste(vix_start, collapse = "-Q"), "\n")
+vix_ts <- ts(as.numeric(vix_quarterly_xts),
+             start = vix_start, frequency = 4)
+```
+
+```{r vix stationnarite}
+trend_vix <- 1:length(vix_ts)
+lm_vix <- lm(as.numeric(vix_ts) ~ trend_vix)
+adftype_vix <- if (summary(lm_vix)$coefficients[2, 4] < 0.05) "ct" else "c"
+adf_vix <- adfTest_valid(vix_ts, kmax = 12, adftype = adftype_vix)
+adf_vix
+kpss.test(vix_ts, null = if (adftype_vix == "ct") "Trend" else "Level")
+```
+
+```{r var vix}
+# mm logique d'alignement par intersection effective qu'avec le CISS
+range_vix <- c(start(vix_ts), end(vix_ts))
+cat("Plage de vix_ts :", paste(range_vix[1:2], collapse = "-"),
+    "à", paste(range_vix[3:4], collapse = "-"), "\n")
+
+start_common_vix <- max(yq(start(dx_eu)),  yq(start(vix_ts)))
+end_common_vix   <- min(yq(end(dx_eu)),    yq(end(vix_ts)))
+common_start_vix <- to_tsstart(start_common_vix)
+common_end_vix   <- to_tsstart(end_common_vix)
+
+dx_aligne_vix <- window(dx_eu,  start = common_start_vix, end = common_end_vix)
+vix_aligne    <- window(vix_ts, start = common_start_vix, end = common_end_vix)
+
+stopifnot(length(dx_aligne_vix) == length(vix_aligne))
+stopifnot(all.equal(as.numeric(time(dx_aligne_vix)),
+                    as.numeric(time(vix_aligne))))
+
+systeme_vix <- cbind(dx_aligne_vix, vix_aligne)
+colnames(systeme_vix) <- c("Exposition", "VIX")
+
+VARselect(systeme_vix, lag.max = 8, type = "const")
+modele_var_vix <- VAR(systeme_vix, p = 1, type = "const")
+serial.test(modele_var_vix, lags.pt = 10, type = "PT.asymptotic")
+roots(modele_var_vix)
+
+causality(modele_var_vix, cause = "VIX")$Granger
+causality(modele_var_vix, cause = "Exposition")$Granger
+```
+
+```{r ts identification}
+# résidus OLS 
+if (!exists("lm_x")) {
+  trend_x <- 1:length(x)
+  lm_x <- lm(as.numeric(x) ~ trend_x)
+}
+y_hat <- ts(residuals(lm_x), start = start(x), frequency = 4)
+
+pdf("plot_acf_pacf_residus_ols.pdf", width = 12, height = 8)
+par(mfrow = c(1, 2))
+acf(as.numeric(y_hat), lag.max = 16, main = "ACF sur résidus OLS (x ~ t)", 
+    col = "#003399", lwd = 2, xaxt = "n")
+axis(1, at = seq(0, 16, by = 5)) # Affiche 0, 5, 10, 15
+
+# PACF
+pacf(as.numeric(y_hat), lag.max = 16, main = "PACF sur résidus OLS (x ~ t)", 
+     col = "#003399", lwd = 2, xaxt = "n")
+axis(1, at = seq(0, 16, by = 5)) # Affiche 0, 5, 10, 15
+
+par(mfrow = c(1, 1))
+dev.off()
+
+# --- AFFICHAGE RSTUDIO ---
+par(mfrow = c(1, 2))
+
+acf(as.numeric(y_hat), lag.max = 16, main = "ACF sur résidus OLS (x ~ t)", 
+    col = "#003399", lwd = 2, xaxt = "n")
+axis(1, at = seq(0, 16, by = 5))
+
+pacf(as.numeric(y_hat), lag.max = 16, main = "PACF sur résidus OLS (x ~ t)", 
+     col = "#003399", lwd = 2, xaxt = "n")
+axis(1, at = seq(0, 16, by = 5))
+
+par(mfrow = c(1, 1))
+```
+
+```{r ts estimation validation}
+# filtre validité identique à celui de la Partie 1
+ts_modelchoice <- function(p, q, series = y_hat) {
+  estim <- try(forecast::Arima(series, order = c(p, 0, q),
+                               include.mean = TRUE,
+                               method = "ML"), silent = TRUE)
+  if (inherits(estim, "try-error")) {
+    return(c(p = p, q = q, arsignif = NA, masignif = NA,
+             resnocorr = NA, ok = NA, aic = NA, bic = NA))
+  }
+  s <- signif(estim)
+  ar_idx <- if (p > 0) which(grepl("^ar", colnames(s)))[p] else NA
+  ma_idx <- if (q > 0) which(grepl("^ma", colnames(s)))[q] else NA
+  arsignif <- if (p == 0) NA else s["pval", ar_idx] <= 0.05
+  masignif <- if (q == 0) NA else s["pval", ma_idx] <= 0.05
+  pvals_res <- Qtests(estim$residuals, 24,
+                      fitdf = length(estim$coef))[, 2]
+  resnocorr <- sum(pvals_res < 0.05, na.rm = TRUE) == 0
+  checks <- c(arsignif, masignif, resnocorr)
+  ok <- as.numeric(sum(checks, na.rm = TRUE) == (3 - sum(is.na(checks))))
+  return(c(p = p, q = q, arsignif = arsignif, masignif = masignif,
+           resnocorr = resnocorr, ok = ok, aic = AIC(estim), bic = BIC(estim)))
+}
+
+pqs_ts <- expand.grid(0:2, 0:1)
+ts_results <- t(apply(pqs_ts, 1, function(row) {
+  p <- row[1]; q <- row[2]
+  cat(sprintf("ARMA(%d,%d) sur résidus OLS\n", p, q))
+  ts_modelchoice(p, q)
+}))
+
+cat("\nTableau de validité (Modèle A — trend-stationary) :\n")
+print(ts_results)
+
+ts_valides <- ts_results[!is.na(ts_results[, "ok"]) &
+                          ts_results[, "ok"] == 1, , drop = FALSE]
+if (nrow(ts_valides) > 0) {
+  cat("\nModèles bien ajustés ET valides :\n")
+  print(ts_valides[order(ts_valides[, "bic"]),
+                   c("p", "q", "aic", "bic")])
+  best_ts <- ts_valides[which.min(ts_valides[, "bic"]), ]
+  cat(sprintf("\nMeilleur modèle A : ARMA(%d,%d) sur résidus OLS (BIC = %.1f)\n",
+              best_ts["p"], best_ts["q"], best_ts["bic"]))
+} else {
+  cat("\nAucun modèle ARMA valide sur les résidus OLS.\n")
+}
+```
+
+```{r ts diagnostics}
+if (nrow(ts_valides) > 0) {
+  # Estimation du meilleur modèle A
+  modA <- forecast::Arima(y_hat,
+                          order = c(best_ts["p"], 0, best_ts["q"]),
+                          include.mean = TRUE, method = "ML")
+  cat("Coefficients du Modèle A :\n")
+  print(summary(modA))
+  pdf("plot_diagnostic_residus_modA.pdf", width = 12, height = 8)
+  checkresiduals(modA)
+  dev.off()
+  checkresiduals(modA)
+  # Racines AR si p > 0
+  if (best_ts["p"] > 0) {
+    ar_coef <- modA$coef[grepl("^ar", names(modA$coef))]
+    racines <- polyroot(c(1, -ar_coef))
+    cat("Modules des racines AR :", round(Mod(racines), 3), "\n")
+  }
+}
+```
+
+```{r ts vs ds comparison}
+h_comp <- 8
+n_comp <- length(x)
+x_train_comp <- ts(x[1:(n_comp - h_comp)], start = start(x), frequency = 4)
+x_test_comp  <- x[(n_comp - h_comp + 1):n_comp]
+trend_full   <- 1:n_comp
+
+rmse_norm_comp <- function(fc, actual) {
+  sqrt(mean((as.numeric(fc) - as.numeric(actual))^2)) / sd(x)
+}
+
+# --- Modèle B (difference-stationary) ---
+modB_train <- forecast::Arima(x_train_comp,
+                              order = c(0, 1, 1),
+                              include.drift = TRUE, method = "ML")
+fc_B <- forecast(modB_train, h = h_comp)$mean
+
+# --- Modèle A (trend-stationary) ---
+if (nrow(ts_valides) > 0) {
+  # Ré-estimer lm + ARMA sur la portion d'entraînement
+  trend_train <- 1:length(x_train_comp)
+  lm_train <- lm(as.numeric(x_train_comp) ~ trend_train)
+  y_hat_train <- ts(residuals(lm_train),
+                    start = start(x_train_comp), frequency = 4)
+
+  modA_train <- forecast::Arima(y_hat_train,
+                                order = c(best_ts["p"], 0, best_ts["q"]),
+                                include.mean = TRUE, method = "ML")
+  fc_A_resid <- forecast(modA_train, h = h_comp)$mean
+
+  # Reconversion en niveaux : X_hat = alpha + beta*(T+h) + Y_hat_ARMA
+  alpha_hat <- coef(lm_train)[1]
+  beta_hat  <- coef(lm_train)[2]
+  trend_fc  <- (length(x_train_comp) + 1):(length(x_train_comp) + h_comp)
+  fc_A <- alpha_hat + beta_hat * trend_fc + as.numeric(fc_A_resid)
+
+  # --- Comparaison ---
+  comparison <- tibble::tibble(
+    Modèle = c(
+      sprintf("A — Trend-stat. + ARMA(%d,%d)", best_ts["p"], best_ts["q"]),
+      "B — ARIMA(0,1,1) + drift",
+      "Naïf — RW + drift"
+    ),
+    `RMSE / sd(x)` = c(
+      rmse_norm_comp(fc_A, x_test_comp),
+      rmse_norm_comp(fc_B, x_test_comp),
+      rmse_norm_comp(forecast::rwf(x_train_comp, h = h_comp,
+                                   drift = TRUE)$mean, x_test_comp)
+    )
+  )
+
+  knitr::kable(comparison, digits = 4,
+               caption = "Comparaison trend-stationary (A) vs difference-stationary (B)") %>%
+    kableExtra::kable_styling(full_width = FALSE)
+
+  # --- Graphe des prévisions superposées ---
+  df_comp <- tibble::tibble(
+    date = as.Date(zoo::as.yearqtr(time(x))),
+    historique = as.numeric(x)
+  )
+  dates_fc <- as.Date(zoo::as.yearqtr(time(fc_B)))
+
+  df_fc <- tibble::tibble(
+    date = dates_fc,
+    `Modèle A (trend-stat.)` = fc_A,
+    `Modèle B (ARIMA 0,1,1)` = as.numeric(fc_B),
+    Observé = as.numeric(x_test_comp)
+  ) %>%
+    tidyr::pivot_longer(-date, names_to = "Série", values_to = "valeur")
+
+  ggplot() +
+    geom_line(data = df_comp, aes(x = date, y = historique),
+              color = "#003399", linewidth = 1.2) +
+    geom_line(data = df_fc, aes(x = date, y = valeur, color = Série),
+              linewidth = 1) +
+    geom_vline(xintercept = max(df_comp$date) - h_comp * 91,
+               linetype = "dashed", color = "#8C9DB5") +
+    scale_color_manual(values = c(
+      "Modèle A (trend-stat.)" = "#E63946",
+      "Modèle B (ARIMA 0,1,1)" = "#1E90FF",
+      "Observé" = "#28B463"
+    )) +
+    labs(title = "Prévisions : trend-stationary (A) vs difference-stationary (B)",
+         x = "Trimestre", y = "Montant (M USD)",
+         color = "") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  ggsave("plot_comparaison_trend_diff.pdf", width = 12, height = 8, dpi = 300)
+} else {
+  cat("Pas de modèle A valide — la comparaison se réduit au Modèle B.\n")
+}
+```
+
+```{r ts vs ds diagnostic}
+if (exists("modA") && nrow(ts_valides) > 0) {
+  cat("=== Résidus du Modèle A (trend-stat.) ===\n")
+  jarque.bera.test(residuals(modA))
+
+  cat("\n=== Résidus du Modèle B (ARIMA 0,1,1) ===\n")
+  jarque.bera.test(residuals(final_model))
+
+  cat("\n=== AIC/BIC (sur les résidus respectifs — non directement comparables) ===\n")
+  cat(sprintf("Modèle A : AIC = %.1f, BIC = %.1f\n", AIC(modA), BIC(modA)))
+  cat(sprintf("Modèle B : AIC = %.1f, BIC = %.1f\n",
+              AIC(final_model), BIC(final_model)))
+  cat("(NB : ces AIC/BIC ne sont PAS comparables car estimés sur des séries\n",
+      "différentes — seul le RMSE hors-échantillon est directement comparable.)\n")
+}
+```
+
+```{r benchmarks}
+if (!is.null(final_model)) {
+  h <- 8
+  n <- length(x)
+  x_train <- ts(x[1:(n - h)], start = start(x), frequency = 4)
+  x_test  <- x[(n - h + 1):n]
+
+  # Modèle ARIMA réestimé sur la portion d'entraînement
+  arima_train <- forecast::Arima(x_train,
+                                 order = c(0, 1, 1),
+                                 include.drift = TRUE, method = "ML")
+
+  # Benchmarks naïfs
+  rwf_train   <- forecast::rwf(x_train, h = h, drift = TRUE)
+  snaive_train <- forecast::snaive(x_train, h = h)
+
+  # Prévisions
+  fc_arima  <- forecast(arima_train, h = h)$mean
+  fc_rwf    <- rwf_train$mean
+  fc_snaive <- snaive_train$mean
+
+  # RMSE normalisé par sd(x)
+  rmse_norm <- function(fc, actual) {
+    sqrt(mean((as.numeric(fc) - as.numeric(actual))^2)) / sd(x)
+  }
+
+  benchmark_table <- tibble::tibble(
+    Modèle = c("ARIMA(0,1,1) + drift", "Random walk + drift", "Naïf saisonnier"),
+    `RMSE / sd(x)` = c(rmse_norm(fc_arima, x_test),
+                       rmse_norm(fc_rwf, x_test),
+                       rmse_norm(fc_snaive, x_test))
+  )
+
+  knitr::kable(benchmark_table, digits = 4,
+               caption = "Comparaison de la qualité prédictive (8 trimestres hors-échantillon)") %>%
+    kableExtra::kable_styling(full_width = FALSE)
+}
+```
+
+```{r irf ciss}
+if (exists("modele_var")) {
+  
+  # génération des données IRF 
+  irf_ciss <- vars::irf(modele_var, impulse = "DCISS", response = "Exposition",
+                         n.ahead = 8, boot = TRUE, runs = 500, ci = 0.90)
+  
+  irf_expo <- vars::irf(modele_var, impulse = "Exposition", response = "DCISS",
+                         n.ahead = 8, boot = TRUE, runs = 500, ci = 0.90)
+
+  # fonction interne pour tracer irf
+  plot_irf_pro <- function(irf_obj, titre, y_lab) {
+  # Extraction des données de réponse
+  # On utilise irf_obj$irf[[1]] pour extraire la matrice de réponse
+  res_mat <- irf_obj$irf[[1]]
+  
+  # On calcule l'horizon en comptant le nombre de lignes (-1 car on commence à 0)
+  horizon_max <- nrow(res_mat) - 1
+  
+  # Création du data frame de manière plus robuste
+  df <- data.frame(
+    Horizon = 0:horizon_max,
+    Response = as.numeric(res_mat),
+    Lower = as.numeric(irf_obj$Lower[[1]]),
+    Upper = as.numeric(irf_obj$Upper[[1]])
+  )
+  
+  ggplot(df, aes(x = Horizon)) +
+    # Zone de confiance remplie (#1E90FF avec 20% d'opacité)
+    geom_ribbon(aes(ymin = Lower, ymax = Upper), fill = "#1E90FF", alpha = 0.2) +
+    # Lignes de l'intervalle en pointillé bleu clair
+    geom_line(aes(y = Lower), color = "#1E90FF", linetype = "dashed", linewidth = 0.5) +
+    geom_line(aes(y = Upper), color = "#1E90FF", linetype = "dashed", linewidth = 0.5) +
+    # Ligne de zéro pour la référence
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+    # Tracé médian en bleu foncé #003399
+    geom_line(aes(y = Response), color = "#003399", linewidth = 1.2) +
+    # Configuration des axes
+    scale_x_continuous(breaks = seq(0, horizon_max, by = 1)) +
+    labs(title = titre, x = "Trimestres après le choc", y = y_lab) +
+    theme_minimal() +
+    theme(
+      axis.title.x = element_text(size = 14, face = "bold"),
+      axis.title.y = element_text(size = 14, face = "bold"),
+      axis.text.x  = element_text(size = 12),
+      axis.text.y  = element_text(size = 12),
+      plot.title   = element_text(size = 16, face = "bold")
+    )
+}
+
+  # generation + sauvegarde
+  
+  # graphique 1 : Choc CISS -> Exposition
+  p1 <- plot_irf_pro(irf_ciss, "Réponse de l'exposition à un choc CISS", "Exposition")
+  print(p1)
+  ggsave("plot_irf_ciss_expo.pdf", plot = p1, width = 12, height = 8)
+
+  # graphique 2 : Choc Exposition -> CISS
+  p2 <- plot_irf_pro(irf_expo, "Réponse du CISS à un choc d'exposition", "Delta CISS")
+  print(p2)
+  ggsave("plot_irf_expo_ciss.pdf", plot = p2, width = 12, height = 8)
+}
+```
+
+```{r fevd}
+if (exists("modele_var")) {
+  fevd_var <- vars::fevd(modele_var, n.ahead = 8)
+  cat("Décomposition de la variance — Δexposition :\n")
+  print(round(fevd_var$Exposition, 4))
+  cat("\nDécomposition de la variance — ΔCISS :\n")
+  print(round(fevd_var$DCISS, 4))
+}
+```
+
+```{r irf robustness}
+if (exists("systeme_bivarie")) {
+  # inversion de l'ordre pour la décomposition de Cholesky
+  systeme_bivarie_inv <- systeme_bivarie[, c("DCISS", "Exposition")]
+  modele_var_inv <- vars::VAR(systeme_bivarie_inv, p = 1, type = "const")
+  
+  # calcul de l'IRF
+  irf_inv <- vars::irf(modele_var_inv,
+                       impulse    = "DCISS",
+                       response   = "Exposition",
+                       n.ahead    = 8,
+                       boot       = TRUE, 
+                       runs       = 500, 
+                       ci         = 0.90)
+  
+  # génération du graphique avec la fonction pro (couleurs et axes larges)
+  # On utilise la fonction plot_irf_pro définie précédemment
+  p_rob <- plot_irf_pro(irf_inv, 
+                        titre = "IRF avec ordre inversé (Robustesse)", 
+                        y_lab = "Exposition")
+  
+  # affichage RStudio
+  print(p_rob)
+  
+  # sauvegarde 
+  ggsave("plot_irf_robustesse_cholesky.pdf", plot = p_rob, width = 12, height = 8)
+}
+```
+
+```{r johansen}
+if (exists("x_eu") && exists("ciss_ts")) {
+  # Vérifier les bornes communes de manière robuste
+  start_common_lev <- max(yq(start(x_eu)), yq(start(ciss_ts)))
+  end_common_lev   <- min(yq(end(x_eu)),    yq(end(ciss_ts)))
+  cs_lev <- to_tsstart(start_common_lev)
+  ce_lev <- to_tsstart(end_common_lev)
+
+  x_eu_lev    <- window(x_eu,    start = cs_lev, end = ce_lev)
+  ciss_ts_lev <- window(ciss_ts, start = cs_lev, end = ce_lev)
+
+  # IMPORTANT : remettre les deux séries à des échelles comparables avant ca.jo.
+  # x_eu_lev est en millions USD (~10^7), ciss_ts_lev est dans [0, 0.5].
+  # Sans rescaling, la matrice de covariance combinée est numériquement
+  # singulière (~14 ordres de grandeur d'écart sur les valeurs propres) et
+  # urca::ca.jo retourne 'system is computationally singular'. Le test de
+  # Johansen est invariant aux transformations linéaires, donc rescaler ne
+  # change pas le résultat — c'est purement un problème numérique.
+  exposition_scaled <- as.numeric(x_eu_lev) / 1e6   # → en milliers de Md USD
+  ciss_scaled       <- as.numeric(ciss_ts_lev)       # déjà dans [0, 0.5]
+
+  niveaux <- cbind(exposition_scaled, ciss_scaled)
+  colnames(niveaux) <- c("Exposition", "CISS")
+
+  cat("Échelles après rescaling :\n")
+  cat(sprintf("  Exposition : moyenne = %.2f, sd = %.2f\n",
+              mean(niveaux[, "Exposition"]), sd(niveaux[, "Exposition"])))
+  cat(sprintf("  CISS       : moyenne = %.2f, sd = %.2f\n",
+              mean(niveaux[, "CISS"]), sd(niveaux[, "CISS"])))
+
+  # Test de Johansen avec K=2 (correspond au VAR(1) en différences)
+  joh <- urca::ca.jo(niveaux, type = "trace", ecdet = "const", K = 2)
+  summary(joh)
+}
+```
+
+```{r rolling granger}
+if (exists("systeme_bivarie")) {
+  window_size <- 20
+  n_total <- nrow(systeme_bivarie)
+
+  if (n_total > window_size) {
+    rolling_results <- tibble::tibble(
+      end_quarter = numeric(),
+      pval_ciss_to_expo = numeric(),
+      pval_expo_to_ciss = numeric()
+    )
+
+    for (i in window_size:n_total) {
+      window_data <- systeme_bivarie[(i - window_size + 1):i, ]
+      mod_window <- try(vars::VAR(window_data, p = 1, type = "const"), silent = TRUE)
+
+      if (!inherits(mod_window, "try-error")) {
+        gc1 <- try(vars::causality(mod_window, cause = "DCISS")$Granger$p.value,
+                   silent = TRUE)
+        gc2 <- try(vars::causality(mod_window, cause = "Exposition")$Granger$p.value,
+                   silent = TRUE)
+
+        rolling_results <- rolling_results %>%
+          dplyr::add_row(
+            end_quarter = as.numeric(time(systeme_bivarie))[i],
+            pval_ciss_to_expo = if (inherits(gc1, "try-error")) NA_real_ else gc1,
+            pval_expo_to_ciss = if (inherits(gc2, "try-error")) NA_real_ else gc2
+          )
+      }
+    }
+
+    # préparation des données pour ggplot
+    rolling_long <- rolling_results %>%
+      tidyr::pivot_longer(cols = c(pval_ciss_to_expo, pval_expo_to_ciss),
+                          names_to = "direction", values_to = "pval") %>%
+      dplyr::mutate(direction = dplyr::recode(direction,
+        pval_ciss_to_expo = "Variation CISS -> Variation Exposition",
+        pval_expo_to_ciss = "Variation Exposition -> Variation CISS"))
+
+    # graphique
+    p_rolling <- ggplot(rolling_long, aes(x = end_quarter, y = pval, color = direction)) +
+      geom_line(linewidth = 1.2) +
+      geom_point(size = 3) +
+      geom_hline(yintercept = 0.05, linetype = "dashed", color = "red", linewidth = 0.8) +
+      geom_hline(yintercept = 0.10, linetype = "dotted", color = "black", linewidth = 0.8) +
+      scale_color_manual(values = c("Variation CISS -> Variation Exposition" = "#003399",
+                                     "Variation Exposition -> Variation CISS" = "#1E90FF")) +
+      labs(subtitle = "Lignes pointillées : seuils de significativité 5% et 10%",
+           x = "Trimestre de fin de fenêtre", 
+           y = "p-value (Granger)",
+           color = "Direction de causalité :") +
+      theme_minimal() +
+      theme(
+        # aggrandissement textes
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        axis.text.x  = element_text(size = 12),
+        axis.text.y  = element_text(size = 12),
+        plot.subtitle = element_text(size = 11, italic = TRUE),
+        
+        # idem pour légende
+        legend.position = "bottom",
+        legend.title = element_text(size = 9, face = "bold"),
+        legend.text  = element_text(size = 9),
+        legend.background = element_rect(fill = "white", color = "#E7EBF2")
+      )
+
+    # affichage + sauvegarde
+    print(p_rolling)
+    ggsave("plot_rolling_granger.pdf", plot = p_rolling, width = 12, height = 8, dpi = 300)
+  }
+}
+```
+
+```{r data prioritycountries}
+# mapping pays -> code ISO 2-lettres pour les 5 juridictions prioritaires
+pays_priority_map <- c(
+  "Cayman Islands"  = "KY",
+  "United Kingdom"  = "GB",
+  "Luxembourg"      = "LU",
+  "Ireland"         = "IE",
+  "Japan"           = "JP"
+)
+
+# vérification : les 5 noms existent-ils dans la base
+cat("Vérification des noms de pays dans la base :\n")
+for (p in names(pays_priority_map)) {
+  present <- p %in% unique(data$Counterparty.country)
+  cat(sprintf("  %s : %s\n", p, if (present) "OK" else "ABSENT"))
+}
+stopifnot(all(names(pays_priority_map) %in% unique(data$Counterparty.country)))
+
+# Filtre cohérent avec ceux des Parties 1 et 2 (anti-double-comptage),
+# mais avec ventilation par pays de contrepartie.
+# NB : Position.type == "Cross-border" (et non "All") car la valeur "All"
+# n'est disponible dans les LBS qu'au niveau Counterparty.country ==
+# "All countries (total)". Pour les pays individuels, seul "Cross-border"
+# est renseigné.
+expo_priority_wide <- data %>%
+  dplyr::filter(
+    `Reporting.country`                  == "All reporting countries",
+    `Counterparty.country`               %in% names(pays_priority_map),
+    `Type.of.instruments`                == "All instruments",
+    `Currency.denomination`              == "All currencies",
+    `Counterparty.sector`                == "Non-bank financial institutions",
+    `Type.of.reporting.institutions`     == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)",
+    `Currency.type.of.reporting.country` == "All currencies (=D+F+U)",
+    `Parent.country`                     == "All countries (total)",
+    `Measure`                            == "Amounts outstanding / Stocks",
+    `Balance.sheet.position`             == "Total claims",
+    `Position.type`                      == "Cross-border"
+  )
+
+# Pivot long sur les colonnes trimestrielles
+expo_priority <- expo_priority_wide %>%
+  tidyr::pivot_longer(
+    cols      = all_of(quarter_cols),
+    names_to  = "QUARTER_RAW",
+    values_to = "exposure_nbfi"
+  ) %>%
+  dplyr::filter(!is.na(exposure_nbfi)) %>%
+  dplyr::mutate(
+    QUARTER = stringr::str_replace(QUARTER_RAW, "^X", ""),
+    QUARTER = stringr::str_replace(QUARTER, "\\.", "-"),
+    country = pays_priority_map[`Counterparty.country`]
+  ) %>%
+  dplyr::select(QUARTER, country, exposure_nbfi) %>%
+  dplyr::arrange(country, QUARTER)
+
+cat("Panel pays construit :\n")
+cat("Pays :", paste(unique(expo_priority$country), collapse = ", "), "\n")
+cat("Trimestres :", length(unique(expo_priority$QUARTER)), "\n")
+cat("Lignes totales :", nrow(expo_priority), "\n")
+print(head(expo_priority))
+```
+
+```{r per-country-arima}
+if (exists("expo_priority") && nrow(expo_priority) > 0) {
+
+  pipeline_pays <- function(series_pays, nom_pays) {
+    cat("\n========== ", nom_pays, " ==========\n")
+
+    if (length(series_pays) < 20 || sum(!is.na(series_pays)) < 20) {
+      cat("Série trop courte pour analyse rigoureuse — passée\n")
+      return(NULL)
+    }
+
+    trend_t <- 1:length(series_pays)
+    lm_pays <- lm(as.numeric(series_pays) ~ trend_t)
+    p_trend  <- summary(lm_pays)$coefficients[2, 4]
+    spec_adf <- if (p_trend < 0.05) "ct" else "c"
+    cat(sprintf("Tendance significative ? p = %.4f → spec ADF '%s'\n",
+                p_trend, spec_adf))
+
+    adf_lev <- try(adfTest_valid(series_pays, kmax = 8, adftype = spec_adf),
+                   silent = TRUE)
+    if (inherits(adf_lev, "try-error")) {
+      cat("ADF en échec sur niveau\n"); return(NULL)
+    }
+    p_adf_lev <- adf_lev@test$p.value
+    cat(sprintf("ADF niveau : p = %.4f\n", p_adf_lev))
+
+    d_pays <- if (p_adf_lev > 0.05) 1 else 0
+    if (d_pays == 1) {
+      ds       <- diff(series_pays)
+      adf_diff <- try(adfTest_valid(ds, kmax = 8, adftype = "c"), silent = TRUE)
+      if (!inherits(adf_diff, "try-error"))
+        cat(sprintf("ADF différencié : p = %.4f\n", adf_diff@test$p.value))
+    }
+
+    grille <- expand.grid(p = 0:3, q = 0:1)
+
+    resultats <- lapply(1:nrow(grille), function(i) {
+      pp <- grille$p[i]; qq <- grille$q[i]
+      mod <- try(forecast::Arima(series_pays,
+                                 order        = c(pp, d_pays, qq),
+                                 include.drift = (d_pays == 1),
+                                 method       = "ML"), silent = TRUE)
+      if (inherits(mod, "try-error"))
+        return(data.frame(p=pp, q=qq, ar_ok=NA, ma_ok=NA,
+                          res_ok=NA, ok=NA, aic=NA, bic=NA))
+
+      s      <- signif(mod)
+      ar_idx <- if (pp > 0) which(grepl("^ar", colnames(s)))[pp] else NA
+      ma_idx <- if (qq > 0) which(grepl("^ma", colnames(s)))[qq] else NA
+      ar_ok  <- if (pp == 0) NA else s["pval", ar_idx] <= 0.05
+      ma_ok  <- if (qq == 0) NA else s["pval", ma_idx] <= 0.05
+
+      pvres    <- Qtests(mod$residuals, 24, fitdf = length(mod$coef))[, 2]
+      res_ok   <- sum(pvres < 0.05, na.rm = TRUE) == 0
+      checks   <- c(ar_ok, ma_ok, res_ok)
+      ok       <- as.numeric(sum(checks, na.rm=TRUE) == (3 - sum(is.na(checks))))
+      data.frame(p=pp, q=qq, ar_ok=ar_ok, ma_ok=ma_ok,
+                 res_ok=res_ok, ok=ok, aic=AIC(mod), bic=BIC(mod))
+    })
+    res_df <- do.call(rbind, resultats)
+
+    valides <- res_df[!is.na(res_df$ok) & res_df$ok == 1, , drop = FALSE]
+    if (nrow(valides) == 0) {
+      cat("Aucun modèle bien ajusté ET valide trouvé\n"); return(NULL)
+    }
+    cat(sprintf("Modèles retenus : %d\n", nrow(valides)))
+    print(valides[order(valides$bic), c("p", "q", "aic", "bic")])
+
+    best <- valides[which.min(valides$bic), ]
+    cat(sprintf("Modèle final : ARIMA(%d,%d,%d)%s\n",
+                best$p, d_pays, best$q,
+                if (d_pays == 1) " avec drift" else ""))
+    return(list(p=best$p, d=d_pays, q=best$q, aic=best$aic, bic=best$bic))
+  }
+
+  results_pays <- list()
+  for (pays in c("KY", "GB", "LU", "IE", "JP")) {
+    serie_pays <- expo_priority %>%
+      dplyr::filter(country == pays) %>%
+      dplyr::arrange(QUARTER) %>%
+      dplyr::pull(exposure_nbfi)
+    if (length(serie_pays) > 0) {
+      ts_pays <- ts(serie_pays, start = c(2013, 4), frequency = 4)
+      results_pays[[pays]] <- pipeline_pays(ts_pays, pays)
+    }
+  }
+
+  recap <- do.call(rbind, lapply(names(results_pays), function(p) {
+    if (!is.null(results_pays[[p]]))
+      data.frame(Pays   = p,
+                 Modèle = sprintf("ARIMA(%d,%d,%d)",
+                                  results_pays[[p]]$p,
+                                  results_pays[[p]]$d,
+                                  results_pays[[p]]$q),
+                 AIC    = round(results_pays[[p]]$aic, 1),
+                 BIC    = round(results_pays[[p]]$bic, 1))
+  }))
+  if (!is.null(recap))
+    knitr::kable(recap, caption = "Modèles ARIMA retenus par pays de contrepartie") %>%
+      kableExtra::kable_styling(full_width = FALSE)
+}
+```
+
+```{r data-panel-fred}
+# Construction de la base macro trimestrielle FRED
+build_quarterly <- function(filepath, var_name) {
+  d <- readr::read_csv(filepath, show_col_types = FALSE)
+  date_col <- names(d)[1]    # première col = date
+  val_col  <- names(d)[2]
+  d <- d %>%
+    dplyr::mutate(date = as.Date(.data[[date_col]]),
+                  value = as.numeric(.data[[val_col]])) %>%
+    dplyr::filter(!is.na(date), !is.na(value))
+  d_xts <- xts::xts(d$value, order.by = d$date)
+  d_qtr <- xts::apply.quarterly(d_xts, FUN = mean, na.rm = TRUE)
+
+  result <- tibble::tibble(
+    date = zoo::index(d_qtr),
+    !!var_name := as.numeric(d_qtr)
+  ) %>%
+    dplyr::mutate(QUARTER = paste0(format(date, "%Y"), "-Q",
+                                    lubridate::quarter(date))) %>%
+    dplyr::select(QUARTER, !!sym(var_name))
+  return(result)
+}
+
+# Note: Les chemins utilisent le même répertoire que les autres données du projet
+# Les chemins utilisent data_dir défini au début du notebook
+fred_paths <- list(
+  vix    = file.path(data_dir, "VIXCLS.csv"),
+  baa    = file.path(data_dir, "BAA10YM.csv"),
+  dff    = file.path(data_dir, "DFF.csv"),
+  t10y2y = file.path(data_dir, "T10Y2Y.csv")
+)
+
+if (all(sapply(fred_paths, file.exists))) {
+  fred_quarterly <- purrr::reduce(
+    list(
+      build_quarterly(fred_paths$vix,    "vix"),
+      build_quarterly(fred_paths$baa,    "baa10y"),
+      build_quarterly(fred_paths$dff,    "dff"),
+      build_quarterly(fred_paths$t10y2y, "t10y2y")
+    ),
+    dplyr::full_join, by = "QUARTER"
+  ) %>%
+    dplyr::arrange(QUARTER)
+
+  cat("Base macro trimestrielle :\n")
+  print(head(fred_quarterly))
+  cat("\nDimensions :", dim(fred_quarterly), "\n")
+
+  # Heatmap des corrélations entre variables explicatives
+  fred_cor <- fred_quarterly %>%
+    dplyr::select(-QUARTER) %>%
+    stats::cor(use = "pairwise.complete.obs")
+  cat("\nMatrice de corrélation des variables macro :\n")
+  print(round(fred_cor, 3))
+}
+```
+
+```{r panel construction}
+# Construction du panel pays × trimestre
+if (exists("expo_priority") && exists("fred_quarterly")) {
+
+  panel_data <- expo_priority %>%
+    dplyr::left_join(fred_quarterly, by = "QUARTER") %>%
+    dplyr::group_by(country) %>%
+    dplyr::arrange(QUARTER) %>%
+    dplyr::mutate(
+      d_exposure = exposure_nbfi - dplyr::lag(exposure_nbfi),
+      d_vix      = vix    - dplyr::lag(vix),
+      d_baa      = baa10y - dplyr::lag(baa10y),
+      d_dff      = dff    - dplyr::lag(dff),
+      d_t10y2y   = t10y2y - dplyr::lag(t10y2y),
+      # Lag 1 des variables macro pour spécification dynamique
+      d_vix_l1    = dplyr::lag(d_vix, 1),
+      d_baa_l1    = dplyr::lag(d_baa, 1),
+      d_dff_l1    = dplyr::lag(d_dff, 1),
+      d_t10y2y_l1 = dplyr::lag(d_t10y2y, 1)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(!is.na(d_exposure))
+
+  cat("Panel construit :", nrow(panel_data), "obs.\n")
+  cat("Pays :", paste(unique(panel_data$country), collapse = ", "), "\n")
+
+  # Conversion en pdata.frame
+  panel_pdf <- plm::pdata.frame(panel_data, index = c("country", "QUARTER"))
+}
+```
+
+```{r panel-specs}
+if (exists("panel_pdf")) {
+
+  spec1 <- try(plm::plm(
+    d_exposure ~ d_vix + d_baa + d_dff + d_t10y2y,
+    data = panel_pdf, model = "within", effect = "individual"
+  ), silent = TRUE)
+
+  spec2 <- try(plm::plm(
+    d_exposure ~ d_vix + d_baa + d_dff + d_t10y2y,
+    data = panel_pdf, model = "within", effect = "twoways"
+  ), silent = TRUE)
+
+  spec3 <- try(plm::plm(
+    d_exposure ~ d_vix + d_baa + d_dff + d_t10y2y +
+                 d_vix_l1 + d_baa_l1 + d_dff_l1 + d_t10y2y_l1,
+    data = panel_pdf, model = "within", effect = "individual"
+  ), silent = TRUE)
+
+  panel_pdf$d_exposure_l1 <- plm::lag(panel_pdf$d_exposure, 1)
+  spec4 <- try(plm::plm(
+    d_exposure ~ d_exposure_l1 + d_vix + d_baa + d_dff + d_t10y2y,
+    data = panel_pdf, model = "within", effect = "individual"
+  ), silent = TRUE)
+
+  print_spec <- function(spec, name) {
+    cat(paste0("\n=== ", name, " ===\n"))
+    if (inherits(spec, "try-error")) {
+      cat("Échec de l'estimation :", attr(spec, "condition")$message, "\n")
+      cat("(Probable cause : trop de NA ou degrés de liberté insuffisants)\n")
+    } else {
+      print(lmtest::coeftest(spec, vcov = plm::vcovHC(spec, cluster = "group")))
+    }
+  }
+
+  print_spec(spec1, "Spec 1 : FE pays seuls")
+  print_spec(spec2, "Spec 2 : FE pays + temps (two-ways)")
+  print_spec(spec3, "Spec 3 : FE pays + retards")
+  print_spec(spec4, "Spec 4 : modèle dynamique (lagged DV)")
+
+  cat("\n=== Diagnostic du panel ===\n")
+  cat("Observations totales :", nrow(panel_pdf), "\n")
+  cat("Observations complètes (toutes variables) :",
+      sum(complete.cases(panel_pdf[, c("d_exposure", "d_vix", "d_baa",
+                                        "d_dff", "d_t10y2y")])), "\n")
+  cat("Pays :", length(unique(panel_pdf$country)), "\n")
+  cat("Trimestres :", length(unique(panel_pdf$QUARTER)), "\n")
+
+  if (!inherits(spec1, "try-error")) {
+    spec_re <- try(plm::plm(
+      d_exposure ~ d_vix + d_baa + d_dff + d_t10y2y,
+      data = panel_pdf, model = "random"
+    ), silent = TRUE)
+    if (!inherits(spec_re, "try-error")) {
+      cat("\nTest de Hausman (FE vs RE) :\n")
+      print(plm::phtest(spec1, spec_re))
+    }
+  }
+}
+```
+
+```{r data bank nbfi}
+# Production directe de la base bank+NBFI à partir de data, avec les noms
+# longs cohérents avec ceux des Parties 1 et 2.
+expo_bn_wide <- data %>%
+  dplyr::filter(
+    `Reporting.country`                  == "All reporting countries",
+    `Counterparty.country`               == "All countries (total)",
+    `Type.of.instruments`                == "All instruments",
+    `Currency.denomination`              == "All currencies",
+    `Counterparty.sector`                %in% c("Banks, total",
+                                                 "Non-bank financial institutions"),
+    `Type.of.reporting.institutions`     == "All reporting banks/institutions (domestic, foreign, consortium and unclassified)",
+    `Currency.type.of.reporting.country` == "All currencies (=D+F+U)",
+    `Parent.country`                     == "All countries (total)",
+    `Measure`                            == "Amounts outstanding / Stocks",
+    `Balance.sheet.position`             == "Total claims",
+    `Position.type`                      == "All"
+  )
+
+expo_bn <- expo_bn_wide %>%
+  tidyr::pivot_longer(
+    cols      = all_of(quarter_cols),
+    names_to  = "QUARTER_RAW",
+    values_to = "volume"
+  ) %>%
+  dplyr::filter(!is.na(volume)) %>%
+  dplyr::mutate(
+    QUARTER = stringr::str_replace_all(QUARTER_RAW, c("^X" = "", "\\." = "-")),
+    secteur = dplyr::case_when(
+      `Counterparty.sector` == "Banks, total"                    ~ "vol_bank",
+      `Counterparty.sector` == "Non-bank financial institutions" ~ "vol_nbfi"
+    )
+  ) %>%
+  dplyr::select(QUARTER, secteur, volume) %>%
+  tidyr::pivot_wider(names_from = secteur, values_from = volume) %>%
+  dplyr::arrange(QUARTER)
+
+cat("Base bank/nbfi construite :\n")
+print(head(expo_bn))
+cat("Dimensions :", dim(expo_bn), "\n")
+```
+
+```{r delta delta reg}
+if (exists("expo_bn") && exists("fred_quarterly")) {
+  bn <- expo_bn %>%
+    dplyr::left_join(fred_quarterly, by = "QUARTER") %>%
+    dplyr::arrange(QUARTER) %>%
+    dplyr::mutate(
+      d_vol_nbfi  = vol_nbfi - dplyr::lag(vol_nbfi),
+      d_vol_bank  = vol_bank - dplyr::lag(vol_bank),
+      delta_delta = d_vol_nbfi - d_vol_bank,
+      d_vix       = vix - dplyr::lag(vix)
+    ) %>%
+    dplyr::filter(!is.na(delta_delta), !is.na(d_vix))
+
+  reg_dd <- lm(delta_delta ~ d_vix, data = bn)
+
+  # erreurs-type Newey-West (autocorrélation et hétéroscédasticité)
+  cat("Régression Δ(NBFI) - Δ(Bank) sur ΔVIX, SE Newey-West :\n")
+  print(lmtest::coeftest(reg_dd, vcov = sandwich::NeweyWest(reg_dd)))
+}
+```
