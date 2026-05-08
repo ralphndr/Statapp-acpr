@@ -39,15 +39,15 @@ The study addresses this through three complementary lenses:
 
 **Supplementary macrofinancial series:**
 
-| Variable | Source | Role |
-|---|---|---|
-| Real GDP growth | — | Business cycle |
-| Short-term interest rate | — | Monetary policy |
-| Yield curve slope | — | Term structure |
-| VIX | CBOE | Global market stress |
-| High-yield spread | — | Credit risk |
-| US Dollar Index | — | Dollar funding channel |
-| CISS | ECB | European systemic financial stress |
+| Variable | Role |
+|---|---|
+| Real GDP growth | Business cycle |
+| Short-term interest rate | Monetary policy |
+| Yield curve slope | Term structure |
+| VIX | Global market stress |
+| High-yield spread | Credit risk |
+| US Dollar Index | Dollar funding channel |
+| CISS | European systemic financial stress |
 
 ---
 
@@ -116,16 +116,7 @@ Bivariate VAR(1) on differenced euro-area bank-to-NBFI exposures and ΔCISS, est
 
 ## Authors
 
-| Name | Institution |
-|---|---|
-| Jean-Médérick BESSI | ENSAE / IP Paris |
-| Yasmine BOUTCHICH | ENSAE / IP Paris |
-| Ralph NADER | ENSAE / IP Paris |
-| Massil ZOUAGHI | ENSAE / IP Paris |
-
-**Supervisors:**
-- **Jean-David FERMANIAN** — ENSAE
-- **Lucille COLLET** — ACPR – Banque de France
+Project made by Jean-Médérick BESSI, Yasmine BOUTCHICH, Massil ZOUAGHI and Ralph NADER.
 
 ---
 
@@ -138,5 +129,3 @@ Bivariate VAR(1) on differenced euro-area bank-to-NBFI exposures and ΔCISS, est
 5. McCauley, R.N., Bénétrix, A.S., McGuire, P.M., & von Peter, G. (2019). Financial deglobalisation in banking? *Journal of International Money and Finance*, 94, 116–131.
 
 ---
-
-*ENSAE – Stat'App 2025–2026 | ACPR – Banque de France*
