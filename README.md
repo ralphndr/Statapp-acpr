@@ -114,12 +114,6 @@ Bivariate VAR(1) on differenced euro-area bank-to-NBFI exposures and ΔCISS, est
 
 ---
 
-## Authors
-
-Project made by Jean-Médérick BESSI, Yasmine BOUTCHICH, Massil ZOUAGHI and Ralph NADER.
-
----
-
 ## References
 
 1. Acharya, V.V., Chauhan, R.S., Rajan, R., & Steffen, S. (2024). *Shadow Always Touches the Feet: Implications of Bank Credit Lines to Non-Bank Financial Intermediaries.* NBER Working Paper.
@@ -128,4 +122,9 @@ Project made by Jean-Médérick BESSI, Yasmine BOUTCHICH, Massil ZOUAGHI and Ral
 4. Cetorelli, N., Goldberg, L.S., & Gambacorta, L. (2023). *Where Do Banks End and NBFIs Begin?* NBER Working Paper.
 5. McCauley, R.N., Bénétrix, A.S., McGuire, P.M., & von Peter, G. (2019). Financial deglobalisation in banking? *Journal of International Money and Finance*, 94, 116–131.
 
+
 ---
+
+## Authors
+
+Project made by Jean-Médérick BESSI, Yasmine BOUTCHICH, Massil ZOUAGHI and Ralph NADER.
