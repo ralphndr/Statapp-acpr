@@ -8,7 +8,7 @@
 
 ## Overview
 
-This repository contains the full research code and outputs for a statistical project conducted in collaboration with the **Autorité de Contrôle Prudentiel et de Résolution (ACPR – Banque de France)**. The project investigates the financial interconnections between traditional banks and **Non-Bank Financial Intermediaries (NBFIs)** — investment funds, insurance companies, hedge funds, REITs, money market funds — and their role as potential channels for systemic risk propagation.
+This repository contains the full research code and outputs for a statistical project conducted in collaboration with the **Autorité de Contrôle Prudentiel et de Résolution (ACPR – Banque de France)**. The project investigates the financial interconnections between traditional banks and Non-Bank Financial Intermediaries (NBFIs) and their role as potential channels for systemic risk propagation.
 
 Since the 2008 financial crisis, NBFIs have grown to represent more assets than the banking sector globally (USD 239 trillion vs. 183 trillion in 2021). Yet banks and NBFIs remain deeply intertwined through loans, credit lines, debt securities, and derivatives. Understanding the structure and dynamics of these exposures is central to macroprudential surveillance.
 
@@ -19,9 +19,9 @@ Since the 2008 financial crisis, NBFIs have grown to represent more assets than 
 **In what measure do cross-holdings between banks and NBFIs contribute to the propagation of systemic risk internationally?**
 
 The study addresses this through three complementary lenses:
-1. **Descriptive analysis** — structure, geography, and currency composition of bank-to-NBFI exposures
-2. **Short-term modelling** — regression analysis of macrofinancial determinants and ARIMA forecasting
-3. **Systemic risk assessment** — VAR modelling and Granger causality testing between financial stress and exposures
+1. **Descriptive analysis**: structure, geography, and currency composition of bank-to-NBFI exposures
+2. **Short-term modelling**: regression analysis of macrofinancial determinants and ARIMA forecasting
+3. **Systemic risk assessment**: VAR modelling and Granger causality testing between financial stress and exposures
 
 ---
 
